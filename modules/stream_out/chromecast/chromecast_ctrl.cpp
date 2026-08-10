@@ -391,6 +391,9 @@ int intf_sys_t::httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
             answer->i_version= 0;
             answer->i_type   = HTTPD_MSG_ANSWER;
             answer->i_status = 404;
+            answer->i_body   = 0;
+            httpd_MsgAdd( answer, "Content-Length", "0" );
+            httpd_MsgAdd( answer, "Connection", "close" );
             return VLC_SUCCESS;
         }
         psz_webvtt = strdup( m_subtitle_webvtt );
