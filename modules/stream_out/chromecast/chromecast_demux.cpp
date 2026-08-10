@@ -36,198 +36,14 @@
 #include <vlc_strings.h>
 
 #include "chromecast_common.h"
+#include "chromecast_webvtt.h"
 
 #include <cassert>
 #include <cinttypes>
 #include <new>
 #include <string>
-#include <vector>
 
 static void on_paused_changed_cb(void *data, bool paused);
-
-/**
- * \return true if psz_uri ends with '.' + psz_ext (case-insensitive)
- */
-static bool HasExtension( const char *psz_uri, const char *psz_ext )
-{
-    size_t i_uri = strlen( psz_uri );
-    size_t i_ext = strlen( psz_ext );
-    if( i_uri < i_ext + 1 || psz_uri[i_uri - i_ext - 1] != '.' )
-        return false;
-    return vlc_ascii_strcasecmp( psz_uri + i_uri - i_ext, psz_ext ) == 0;
-}
-
-/**
- * Parses a "[HH:]MM:SS[.,]mmm" timestamp (SRT uses ',' as the decimal
- * separator, WebVTT uses '.'; both are accepted). Returns false if the
- * string doesn't match either form.
- */
-static bool ParseVttTimestamp( const std::string &s, int64_t *out_ms )
-{
-    unsigned h, m, sec, ms;
-    if( sscanf( s.c_str(), "%u:%u:%u%*[,.]%u", &h, &m, &sec, &ms ) == 4 )
-    {
-        *out_ms = ( (int64_t)h * 3600 + m * 60 + sec ) * 1000 + ms;
-        return true;
-    }
-    if( sscanf( s.c_str(), "%u:%u%*[,.]%u", &m, &sec, &ms ) == 3 )
-    {
-        *out_ms = ( (int64_t)m * 60 + sec ) * 1000 + ms;
-        return true;
-    }
-    return false;
-}
-
-static std::string FormatVttTimestamp( int64_t ms )
-{
-    if( ms < 0 )
-        ms = 0;
-    unsigned msec = (unsigned)( ms % 1000 ); ms /= 1000;
-    unsigned sec  = (unsigned)( ms % 60 );   ms /= 60;
-    unsigned min  = (unsigned)( ms % 60 );   ms /= 60;
-    unsigned hour = (unsigned)ms;
-    char buf[32];
-    snprintf( buf, sizeof(buf), "%02u:%02u:%02u.%03u", hour, min, sec, msec );
-    return std::string( buf );
-}
-
-/**
- * SRT and WebVTT share the same cue structure (an optional numeric
- * identifier line, a "start --> end" timing line, then one or more text
- * lines, cues separated by a blank line).
- *
- * Cue timestamps in the source file are always relative to the file's own
- * 0:00. The Chromecast receiver's own playback clock however restarts near
- * 0 for every "segment" it is fed: at the initial LOAD, and again after
- * every seek (the Cast protocol has no concept of seeking within VLC's
- * live-restream, ES_OUT_RESET_PCR just tells the encoder to start a new
- * timestamp epoch and the receiver's clock follows that). i_offset_ms is
- * the source-file position (in ms) the current segment starts at: it is
- * subtracted from every cue so cues line up with the receiver's clock, and
- * any cue that ends before that point (i.e. it belongs to a part of the
- * file no longer being sent) is dropped.
- */
-static std::string ConvertSubtitleToWebVTT( const std::string &content, bool is_srt,
-                                            int64_t i_offset_ms )
-{
-    std::string out( "WEBVTT\n\n" );
-
-    size_t start = 0;
-    /* Strip a leading UTF-8 BOM if present */
-    if( content.compare( 0, 3, "\xEF\xBB\xBF" ) == 0 )
-        start = 3;
-
-    std::vector<std::string> lines;
-    {
-        size_t pos = start;
-        while( pos <= content.size() )
-        {
-            size_t eol = content.find( '\n', pos );
-            std::string line = content.substr( pos, eol == std::string::npos ? std::string::npos : eol - pos );
-            if( !line.empty() && line.back() == '\r' )
-                line.pop_back();
-            lines.push_back( line );
-            if( eol == std::string::npos )
-                break;
-            pos = eol + 1;
-        }
-    }
-
-    size_t i = 0;
-    /* Skip a leading WEBVTT signature line, and any header metadata up to
-     * the first blank line, if present. */
-    if( !is_srt && i < lines.size() && lines[i].compare( 0, 6, "WEBVTT" ) == 0 )
-    {
-        while( i < lines.size() && !lines[i].empty() )
-            ++i;
-    }
-
-    while( i < lines.size() )
-    {
-        while( i < lines.size() && lines[i].empty() )
-            ++i;
-        if( i >= lines.size() )
-            break;
-
-        size_t block_start = i;
-        /* An optional numeric/identifier line precedes the timing line */
-        size_t timing_line = i;
-        if( lines[timing_line].find( "-->" ) == std::string::npos
-         && timing_line + 1 < lines.size() )
-            timing_line = i + 1;
-
-        bool have_timing = false;
-        int64_t cue_start_ms = 0, cue_end_ms = 0;
-        size_t arrow = std::string::npos;
-        if( timing_line < lines.size() )
-        {
-            arrow = lines[timing_line].find( "-->" );
-            if( arrow != std::string::npos )
-            {
-                std::string ts_start = lines[timing_line].substr( 0, arrow );
-                std::string ts_end_raw = lines[timing_line].substr( arrow + 3 );
-                /* Only the first token after "-->" is the timestamp; any
-                 * trailing cue settings (line:, position:, ...) are not
-                 * preserved. */
-                size_t e0 = ts_end_raw.find_first_not_of( " \t" );
-                std::string ts_end = e0 == std::string::npos ? std::string()
-                                    : ts_end_raw.substr( e0 );
-                size_t e1 = ts_end.find_first_of( " \t" );
-                if( e1 != std::string::npos )
-                    ts_end = ts_end.substr( 0, e1 );
-
-                have_timing = ParseVttTimestamp( ts_start, &cue_start_ms )
-                           && ParseVttTimestamp( ts_end, &cue_end_ms );
-            }
-        }
-
-        size_t block_end = ( arrow != std::string::npos ) ? timing_line + 1 : block_start;
-        while( block_end < lines.size() && !lines[block_end].empty() )
-            ++block_end;
-
-        if( have_timing )
-        {
-            cue_start_ms -= i_offset_ms;
-            cue_end_ms -= i_offset_ms;
-
-            /* Drop cues that belong entirely to a part of the file that
-             * isn't part of the current segment. */
-            if( cue_end_ms > 0 )
-            {
-                for( size_t j = block_start; j < timing_line; ++j )
-                {
-                    out += lines[j];
-                    out += '\n';
-                }
-                out += FormatVttTimestamp( cue_start_ms );
-                out += " --> ";
-                out += FormatVttTimestamp( cue_end_ms );
-                out += '\n';
-                for( size_t j = timing_line + 1; j < block_end; ++j )
-                {
-                    out += lines[j];
-                    out += '\n';
-                }
-                out += '\n';
-            }
-        }
-        else
-        {
-            /* Not a cue we understand (e.g. a WebVTT NOTE block): pass it
-             * through unshifted rather than losing it silently. */
-            for( size_t j = block_start; j < block_end; ++j )
-            {
-                out += lines[j];
-                out += '\n';
-            }
-            out += '\n';
-        }
-
-        i = block_end;
-    }
-
-    return out;
-}
 
 /**
  * Reads an external subtitle slave and, if it is a plain SRT or WebVTT
@@ -239,8 +55,9 @@ static std::string ConvertSubtitleToWebVTT( const std::string &content, bool is_
 static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri,
                                    vlc_tick_t i_offset )
 {
-    bool is_srt = HasExtension( psz_uri, "srt" );
-    bool is_vtt = !is_srt && ( HasExtension( psz_uri, "vtt" ) || HasExtension( psz_uri, "webvtt" ) );
+    bool is_srt = chromecast_HasExtension( psz_uri, "srt" );
+    bool is_vtt = !is_srt && ( chromecast_HasExtension( psz_uri, "vtt" )
+                            || chromecast_HasExtension( psz_uri, "webvtt" ) );
     if( !is_srt && !is_vtt )
     {
         msg_Dbg( p_obj, "cc subtitle load: %s has no srt/vtt/webvtt extension", psz_uri );
@@ -283,8 +100,8 @@ static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri,
     msg_Dbg( p_obj, "cc subtitle load: read %zd bytes from %s", read, psz_uri );
     psz_data[read] = '\0';
 
-    std::string converted = ConvertSubtitleToWebVTT( std::string( psz_data, read ),
-                                                     is_srt, MS_FROM_VLC_TICK( i_offset ) );
+    std::string converted = chromecast_ConvertSubtitleToWebVTT( std::string( psz_data, read ),
+                                                                is_srt, MS_FROM_VLC_TICK( i_offset ) );
     char *psz_webvtt = strdup( converted.c_str() );
 
     free( psz_data );
@@ -445,9 +262,9 @@ struct demux_cc
                     continue;
                 /* Only plain SRT/WebVTT slaves can become a sidecar track;
                  * keep looking if this one is a styled/unsupported format. */
-                if( HasExtension( p_slave->psz_uri, "srt" )
-                 || HasExtension( p_slave->psz_uri, "vtt" )
-                 || HasExtension( p_slave->psz_uri, "webvtt" ) )
+                if( chromecast_HasExtension( p_slave->psz_uri, "srt" )
+                 || chromecast_HasExtension( p_slave->psz_uri, "vtt" )
+                 || chromecast_HasExtension( p_slave->psz_uri, "webvtt" ) )
                 {
                     uri = p_slave->psz_uri;
                     break;
