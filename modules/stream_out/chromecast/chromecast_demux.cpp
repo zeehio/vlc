@@ -31,13 +31,128 @@
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
+#include <vlc_input_item.h>
+#include <vlc_stream.h>
+#include <vlc_strings.h>
 
 #include "chromecast_common.h"
 
 #include <cassert>
 #include <new>
+#include <string>
 
 static void on_paused_changed_cb(void *data, bool paused);
+
+/**
+ * \return true if psz_uri ends with '.' + psz_ext (case-insensitive)
+ */
+static bool HasExtension( const char *psz_uri, const char *psz_ext )
+{
+    size_t i_uri = strlen( psz_uri );
+    size_t i_ext = strlen( psz_ext );
+    if( i_uri < i_ext + 1 || psz_uri[i_uri - i_ext - 1] != '.' )
+        return false;
+    return vlc_ascii_strcasecmp( psz_uri + i_uri - i_ext, psz_ext ) == 0;
+}
+
+/**
+ * SRT and WebVTT share the same cue structure (an optional numeric
+ * identifier line, a "start --> end" timing line, then one or more text
+ * lines, cues separated by a blank line). The only on-the-wire difference
+ * relevant here is the decimal separator in timestamps ("," in SRT vs "."
+ * in WebVTT) and the mandatory "WEBVTT" signature as the very first line.
+ */
+static std::string SrtToWebVTT( const std::string &srt )
+{
+    std::string out( "WEBVTT\n\n" );
+
+    size_t start = 0;
+    /* Strip a leading UTF-8 BOM if present */
+    if( srt.compare( 0, 3, "\xEF\xBB\xBF" ) == 0 )
+        start = 3;
+
+    size_t pos = start;
+    while( pos <= srt.size() )
+    {
+        size_t eol = srt.find( '\n', pos );
+        std::string line = srt.substr( pos, eol == std::string::npos ? std::string::npos : eol - pos );
+        if( !line.empty() && line.back() == '\r' )
+            line.pop_back();
+
+        if( line.find( "-->" ) != std::string::npos )
+        {
+            for( char &c : line )
+                if( c == ',' )
+                    c = '.';
+        }
+
+        out += line;
+        out += '\n';
+
+        if( eol == std::string::npos )
+            break;
+        pos = eol + 1;
+    }
+
+    return out;
+}
+
+/**
+ * Reads an external subtitle slave and, if it is a plain SRT or WebVTT
+ * file, returns its content as a heap-allocated WebVTT document (to be
+ * handed over to pf_set_subtitle, which takes ownership). Returns NULL for
+ * anything else (embedded tracks, styled formats such as ASS/SSA, unreadable
+ * or oversized files): those are simply not offered as a Cast sidecar track.
+ */
+static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri )
+{
+    bool is_srt = HasExtension( psz_uri, "srt" );
+    bool is_vtt = !is_srt && ( HasExtension( psz_uri, "vtt" ) || HasExtension( psz_uri, "webvtt" ) );
+    if( !is_srt && !is_vtt )
+        return NULL;
+
+    stream_t *s = vlc_stream_NewURL( p_obj, psz_uri );
+    if( s == NULL )
+        return NULL;
+
+    uint64_t size;
+    /* Subtitle files are tiny; refuse anything unreasonable rather than
+     * load a mismatched/huge resource into memory. */
+    if( vlc_stream_GetSize( s, &size ) != VLC_SUCCESS || size == 0
+     || size > INT64_C(4000000) )
+    {
+        vlc_stream_Delete( s );
+        return NULL;
+    }
+
+    char *psz_data = (char *)malloc( size + 1 );
+    if( psz_data == NULL )
+    {
+        vlc_stream_Delete( s );
+        return NULL;
+    }
+
+    ssize_t read = vlc_stream_Read( s, psz_data, size );
+    vlc_stream_Delete( s );
+    if( read <= 0 )
+    {
+        free( psz_data );
+        return NULL;
+    }
+    psz_data[read] = '\0';
+
+    char *psz_webvtt;
+    if( is_srt )
+    {
+        std::string converted = SrtToWebVTT( std::string( psz_data, read ) );
+        psz_webvtt = strdup( converted.c_str() );
+    }
+    else /* already WebVTT: pass through as-is */
+        psz_webvtt = strdup( psz_data );
+
+    free( psz_data );
+    return psz_webvtt;
+}
 
 struct demux_cc
 {
@@ -93,6 +208,8 @@ struct demux_cc
         if (demux_Control( p_demux->p_next, DEMUX_GET_LENGTH, &m_length ) != VLC_SUCCESS)
             m_length = -1;
 
+        setSubtitleFromSlaves();
+
         int i_current_title;
         if( demux_Control( p_demux->p_next, DEMUX_GET_TITLE,
                            &i_current_title ) == VLC_SUCCESS )
@@ -143,7 +260,49 @@ struct demux_cc
     {
         assert(p_renderer);
         p_renderer->pf_set_meta( p_renderer->p_opaque, NULL );
+        p_renderer->pf_set_subtitle( p_renderer->p_opaque, NULL );
         p_renderer->pf_set_demux_enabled(p_renderer->p_opaque, false, NULL, NULL);
+    }
+
+    /**
+     * Look for an external SRT/WebVTT subtitle slave on the input item and,
+     * if found, hand it over as a Cast sidecar text track. Only external
+     * slaves are considered (not embedded tracks): this is the only case
+     * where the whole subtitle content is available upfront, which a sidecar
+     * track needs since it is fetched once by the Cast receiver rather than
+     * streamed incrementally. Re-evaluated each time this demux filter is
+     * (re)enabled, so subtitles added before a cast starts are picked up;
+     * slaves added while already casting need a session restart to appear.
+     */
+    void setSubtitleFromSlaves()
+    {
+        std::string uri;
+        input_item_t *p_item = p_demux->p_next->p_input ?
+                               input_GetItem( p_demux->p_next->p_input ) : NULL;
+        if( p_item )
+        {
+            vlc_mutex_lock( &p_item->lock );
+            for( int i = 0; i < p_item->i_slaves; ++i )
+            {
+                const input_item_slave_t *p_slave = p_item->pp_slaves[i];
+                if( p_slave->i_type != SLAVE_TYPE_SPU )
+                    continue;
+                /* Only plain SRT/WebVTT slaves can become a sidecar track;
+                 * keep looking if this one is a styled/unsupported format. */
+                if( HasExtension( p_slave->psz_uri, "srt" )
+                 || HasExtension( p_slave->psz_uri, "vtt" )
+                 || HasExtension( p_slave->psz_uri, "webvtt" ) )
+                {
+                    uri = p_slave->psz_uri;
+                    break;
+                }
+            }
+            vlc_mutex_unlock( &p_item->lock );
+        }
+
+        char *psz_webvtt = uri.empty() ? NULL
+                          : LoadSubtitleAsWebVTT( VLC_OBJECT(p_demux), uri.c_str() );
+        p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );
     }
 
     void resetTimes()

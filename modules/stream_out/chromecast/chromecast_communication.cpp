@@ -284,7 +284,8 @@ static std::string meta_get_escaped(const vlc_meta_t *p_meta, vlc_meta_type_t ty
 }
 
 std::string ChromecastCommunication::GetMedia( const std::string& mime,
-                                               const vlc_meta_t *p_meta )
+                                               const vlc_meta_t *p_meta,
+                                               const std::string& subtitleUrl )
 {
     std::stringstream ss;
 
@@ -353,17 +354,35 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
        << ",\"streamType\":\"LIVE\""
        << ",\"contentType\":\"" << mime << "\"";
 
+    if( !subtitleUrl.empty() )
+    {
+        /* Sidecar text track: rendered by the Cast receiver itself instead
+         * of being burned into the video. Only text tracks are supported by
+         * the Styled/Default Media Receiver without a custom receiver app. */
+        ss << ",\"tracks\":[{"
+           <<   "\"trackId\":" << CC_SUBTITLE_TRACK_ID << ","
+           <<   "\"type\":\"TEXT\","
+           <<   "\"subtype\":\"SUBTITLES\","
+           <<   "\"trackContentId\":\"" << escape_json( subtitleUrl ) << "\","
+           <<   "\"trackContentType\":\"text/vtt\","
+           <<   "\"name\":\"" << escape_json( _("Subtitles") ) << "\""
+           << "}]";
+    }
+
     return ss.str();
 }
 
 unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
-                                             const std::string& mime, const vlc_meta_t *p_meta )
+                                             const std::string& mime, const vlc_meta_t *p_meta,
+                                             const std::string& subtitleUrl )
 {
     unsigned id = getNextRequestId();
     std::stringstream ss;
     ss << "{\"type\":\"LOAD\","
-       <<  "\"media\":{" << GetMedia( mime, p_meta ) << "},"
-       <<  "\"autoplay\":\"false\","
+       <<  "\"media\":{" << GetMedia( mime, p_meta, subtitleUrl ) << "},";
+    if( !subtitleUrl.empty() )
+        ss << "\"activeTrackIds\":[" << CC_SUBTITLE_TRACK_ID << "],";
+    ss <<  "\"autoplay\":\"false\","
        <<  "\"requestId\":" << id
        << "}";
 
