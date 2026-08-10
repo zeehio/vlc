@@ -45,6 +45,8 @@ vlc_modules += {
     'name' : 'demux_chromecast',
     'sources' : files(
         'chromecast_demux.cpp',
+        'chromecast_webvtt.cpp',
+        'chromecast_webvtt.h',
         'chromecast.h',
         'chromecast_common.h') + chromecast_proto,
     'dependencies' : [protobuf_dep],

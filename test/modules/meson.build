@@ -229,3 +229,15 @@ vlc_tests += {
     'link_with' : [libvlc, libvlccore],
     'module_depends' : vlc_plugins_targets.keys()
 }
+
+# Pure string logic (no VLC dependency at all), so no link_with/module_depends
+# is needed: the sidecar generation code it tests is deliberately factored
+# out of chromecast_demux.cpp for this reason.
+vlc_tests += {
+    'name' : 'test_modules_stream_out_chromecast_webvtt',
+    'sources' : files(
+        'stream_out/chromecast_webvtt.cpp',
+        '../../modules/stream_out/chromecast/chromecast_webvtt.cpp',
+        '../../modules/stream_out/chromecast/chromecast_webvtt.h'),
+    'suite' : ['modules', 'test_modules'],
+}
