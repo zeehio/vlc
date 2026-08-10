@@ -41,6 +41,7 @@
 #include <cinttypes>
 #include <new>
 #include <string>
+#include <vector>
 
 static void on_paused_changed_cb(void *data, bool paused);
 
@@ -57,42 +58,172 @@ static bool HasExtension( const char *psz_uri, const char *psz_ext )
 }
 
 /**
+ * Parses a "[HH:]MM:SS[.,]mmm" timestamp (SRT uses ',' as the decimal
+ * separator, WebVTT uses '.'; both are accepted). Returns false if the
+ * string doesn't match either form.
+ */
+static bool ParseVttTimestamp( const std::string &s, int64_t *out_ms )
+{
+    unsigned h, m, sec, ms;
+    if( sscanf( s.c_str(), "%u:%u:%u%*[,.]%u", &h, &m, &sec, &ms ) == 4 )
+    {
+        *out_ms = ( (int64_t)h * 3600 + m * 60 + sec ) * 1000 + ms;
+        return true;
+    }
+    if( sscanf( s.c_str(), "%u:%u%*[,.]%u", &m, &sec, &ms ) == 3 )
+    {
+        *out_ms = ( (int64_t)m * 60 + sec ) * 1000 + ms;
+        return true;
+    }
+    return false;
+}
+
+static std::string FormatVttTimestamp( int64_t ms )
+{
+    if( ms < 0 )
+        ms = 0;
+    unsigned msec = (unsigned)( ms % 1000 ); ms /= 1000;
+    unsigned sec  = (unsigned)( ms % 60 );   ms /= 60;
+    unsigned min  = (unsigned)( ms % 60 );   ms /= 60;
+    unsigned hour = (unsigned)ms;
+    char buf[32];
+    snprintf( buf, sizeof(buf), "%02u:%02u:%02u.%03u", hour, min, sec, msec );
+    return std::string( buf );
+}
+
+/**
  * SRT and WebVTT share the same cue structure (an optional numeric
  * identifier line, a "start --> end" timing line, then one or more text
- * lines, cues separated by a blank line). The only on-the-wire difference
- * relevant here is the decimal separator in timestamps ("," in SRT vs "."
- * in WebVTT) and the mandatory "WEBVTT" signature as the very first line.
+ * lines, cues separated by a blank line).
+ *
+ * Cue timestamps in the source file are always relative to the file's own
+ * 0:00. The Chromecast receiver's own playback clock however restarts near
+ * 0 for every "segment" it is fed: at the initial LOAD, and again after
+ * every seek (the Cast protocol has no concept of seeking within VLC's
+ * live-restream, ES_OUT_RESET_PCR just tells the encoder to start a new
+ * timestamp epoch and the receiver's clock follows that). i_offset_ms is
+ * the source-file position (in ms) the current segment starts at: it is
+ * subtracted from every cue so cues line up with the receiver's clock, and
+ * any cue that ends before that point (i.e. it belongs to a part of the
+ * file no longer being sent) is dropped.
  */
-static std::string SrtToWebVTT( const std::string &srt )
+static std::string ConvertSubtitleToWebVTT( const std::string &content, bool is_srt,
+                                            int64_t i_offset_ms )
 {
     std::string out( "WEBVTT\n\n" );
 
     size_t start = 0;
     /* Strip a leading UTF-8 BOM if present */
-    if( srt.compare( 0, 3, "\xEF\xBB\xBF" ) == 0 )
+    if( content.compare( 0, 3, "\xEF\xBB\xBF" ) == 0 )
         start = 3;
 
-    size_t pos = start;
-    while( pos <= srt.size() )
+    std::vector<std::string> lines;
     {
-        size_t eol = srt.find( '\n', pos );
-        std::string line = srt.substr( pos, eol == std::string::npos ? std::string::npos : eol - pos );
-        if( !line.empty() && line.back() == '\r' )
-            line.pop_back();
-
-        if( line.find( "-->" ) != std::string::npos )
+        size_t pos = start;
+        while( pos <= content.size() )
         {
-            for( char &c : line )
-                if( c == ',' )
-                    c = '.';
+            size_t eol = content.find( '\n', pos );
+            std::string line = content.substr( pos, eol == std::string::npos ? std::string::npos : eol - pos );
+            if( !line.empty() && line.back() == '\r' )
+                line.pop_back();
+            lines.push_back( line );
+            if( eol == std::string::npos )
+                break;
+            pos = eol + 1;
+        }
+    }
+
+    size_t i = 0;
+    /* Skip a leading WEBVTT signature line, and any header metadata up to
+     * the first blank line, if present. */
+    if( !is_srt && i < lines.size() && lines[i].compare( 0, 6, "WEBVTT" ) == 0 )
+    {
+        while( i < lines.size() && !lines[i].empty() )
+            ++i;
+    }
+
+    while( i < lines.size() )
+    {
+        while( i < lines.size() && lines[i].empty() )
+            ++i;
+        if( i >= lines.size() )
+            break;
+
+        size_t block_start = i;
+        /* An optional numeric/identifier line precedes the timing line */
+        size_t timing_line = i;
+        if( lines[timing_line].find( "-->" ) == std::string::npos
+         && timing_line + 1 < lines.size() )
+            timing_line = i + 1;
+
+        bool have_timing = false;
+        int64_t cue_start_ms = 0, cue_end_ms = 0;
+        size_t arrow = std::string::npos;
+        if( timing_line < lines.size() )
+        {
+            arrow = lines[timing_line].find( "-->" );
+            if( arrow != std::string::npos )
+            {
+                std::string ts_start = lines[timing_line].substr( 0, arrow );
+                std::string ts_end_raw = lines[timing_line].substr( arrow + 3 );
+                /* Only the first token after "-->" is the timestamp; any
+                 * trailing cue settings (line:, position:, ...) are not
+                 * preserved. */
+                size_t e0 = ts_end_raw.find_first_not_of( " \t" );
+                std::string ts_end = e0 == std::string::npos ? std::string()
+                                    : ts_end_raw.substr( e0 );
+                size_t e1 = ts_end.find_first_of( " \t" );
+                if( e1 != std::string::npos )
+                    ts_end = ts_end.substr( 0, e1 );
+
+                have_timing = ParseVttTimestamp( ts_start, &cue_start_ms )
+                           && ParseVttTimestamp( ts_end, &cue_end_ms );
+            }
         }
 
-        out += line;
-        out += '\n';
+        size_t block_end = ( arrow != std::string::npos ) ? timing_line + 1 : block_start;
+        while( block_end < lines.size() && !lines[block_end].empty() )
+            ++block_end;
 
-        if( eol == std::string::npos )
-            break;
-        pos = eol + 1;
+        if( have_timing )
+        {
+            cue_start_ms -= i_offset_ms;
+            cue_end_ms -= i_offset_ms;
+
+            /* Drop cues that belong entirely to a part of the file that
+             * isn't part of the current segment. */
+            if( cue_end_ms > 0 )
+            {
+                for( size_t j = block_start; j < timing_line; ++j )
+                {
+                    out += lines[j];
+                    out += '\n';
+                }
+                out += FormatVttTimestamp( cue_start_ms );
+                out += " --> ";
+                out += FormatVttTimestamp( cue_end_ms );
+                out += '\n';
+                for( size_t j = timing_line + 1; j < block_end; ++j )
+                {
+                    out += lines[j];
+                    out += '\n';
+                }
+                out += '\n';
+            }
+        }
+        else
+        {
+            /* Not a cue we understand (e.g. a WebVTT NOTE block): pass it
+             * through unshifted rather than losing it silently. */
+            for( size_t j = block_start; j < block_end; ++j )
+            {
+                out += lines[j];
+                out += '\n';
+            }
+            out += '\n';
+        }
+
+        i = block_end;
     }
 
     return out;
@@ -105,7 +236,8 @@ static std::string SrtToWebVTT( const std::string &srt )
  * anything else (embedded tracks, styled formats such as ASS/SSA, unreadable
  * or oversized files): those are simply not offered as a Cast sidecar track.
  */
-static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri )
+static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri,
+                                   vlc_tick_t i_offset )
 {
     bool is_srt = HasExtension( psz_uri, "srt" );
     bool is_vtt = !is_srt && ( HasExtension( psz_uri, "vtt" ) || HasExtension( psz_uri, "webvtt" ) );
@@ -151,14 +283,9 @@ static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri )
     msg_Dbg( p_obj, "cc subtitle load: read %zd bytes from %s", read, psz_uri );
     psz_data[read] = '\0';
 
-    char *psz_webvtt;
-    if( is_srt )
-    {
-        std::string converted = SrtToWebVTT( std::string( psz_data, read ) );
-        psz_webvtt = strdup( converted.c_str() );
-    }
-    else /* already WebVTT: pass through as-is */
-        psz_webvtt = strdup( psz_data );
+    std::string converted = ConvertSubtitleToWebVTT( std::string( psz_data, read ),
+                                                     is_srt, MS_FROM_VLC_TICK( i_offset ) );
+    char *psz_webvtt = strdup( converted.c_str() );
 
     free( psz_data );
     return psz_webvtt;
@@ -171,6 +298,7 @@ struct demux_cc
         ,p_renderer(renderer)
         ,m_enabled( true )
         ,m_subtitle_scanned( false )
+        ,m_subtitle_loaded_once( false )
     {
         init();
     }
@@ -228,6 +356,11 @@ struct demux_cc
          * which only runs once Init() (and therefore LoadSlaves()) has
          * fully completed. */
         m_subtitle_scanned = false;
+        /* This is a fresh casting session (or the demux filter was just
+         * re-enabled): its own initial LOAD, sent by the caller, will pick
+         * up whatever the upcoming scan sets, so no explicit reload should
+         * be requested for it. */
+        m_subtitle_loaded_once = false;
 
         int i_current_title;
         if( demux_Control( p_demux->s, DEMUX_GET_TITLE,
@@ -329,10 +462,38 @@ struct demux_cc
         else
             msg_Dbg( p_demux, "cc subtitle scan: using slave uri=%s", uri.c_str() );
 
+        vlc_tick_t offset = 0;
+        if( !uri.empty()
+         && demux_Control( p_demux->s, DEMUX_GET_TIME, &offset ) != VLC_SUCCESS )
+            offset = 0;
+
         char *psz_webvtt = uri.empty() ? NULL
-                          : LoadSubtitleAsWebVTT( VLC_OBJECT(p_demux), uri.c_str() );
-        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s", psz_webvtt ? "generated" : "NULL (not set)" );
+                          : LoadSubtitleAsWebVTT( VLC_OBJECT(p_demux), uri.c_str(), offset );
+        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms)",
+                psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ) );
         p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );
+
+        if( psz_webvtt != NULL )
+        {
+            /* The Cast protocol only fetches a sidecar text track once, at
+             * LOAD time, and never refreshes it on its own (the media is
+             * declared as a LIVE stream, which has no notion of seeking:
+             * VLC implements seeking locally and just keeps feeding the
+             * same connection from a new position). The very first time
+             * this runs, the initial LOAD triggered by the caller already
+             * picks up what was just set above; on every subsequent call
+             * (a seek re-triggered the scan) the receiver is still showing
+             * cues generated for the previous segment, so force a fresh
+             * LOAD to make it re-fetch what was just regenerated. */
+            if( m_subtitle_loaded_once )
+            {
+                msg_Dbg( p_demux, "cc subtitle scan: requesting a reload so the "
+                        "receiver re-fetches the regenerated sidecar track" );
+                p_renderer->pf_reload( p_renderer->p_opaque );
+            }
+            else
+                m_subtitle_loaded_once = true;
+        }
     }
 
     void resetTimes()
@@ -551,6 +712,11 @@ struct demux_cc
 
             resetTimes();
             resetDemuxEof();
+            /* The segment the receiver is about to be fed starts at a new
+             * position: re-run the subtitle scan on the next Demux() call
+             * so the sidecar track (if any) gets regenerated for it and
+             * the receiver is told to reload. */
+            m_subtitle_scanned = false;
             return VLC_SUCCESS;
         }
         case DEMUX_SET_TIME:
@@ -563,6 +729,7 @@ struct demux_cc
 
             resetTimes();
             resetDemuxEof();
+            m_subtitle_scanned = false;
             return VLC_SUCCESS;
         }
         case DEMUX_SET_PAUSE_STATE:
@@ -584,6 +751,7 @@ struct demux_cc
             seekBack(m_last_time, m_last_pos);
             resetTimes();
             resetDemuxEof();
+            m_subtitle_scanned = false;
             break;
         case DEMUX_FILTER_ENABLE:
             p_renderer = static_cast<chromecast_common *>(
@@ -618,6 +786,7 @@ protected:
     bool          m_can_seek;
     bool          m_enabled;
     bool          m_subtitle_scanned;
+    bool          m_subtitle_loaded_once;
     bool          m_demux_eof;
     double        m_start_pos;
     double        m_last_pos;

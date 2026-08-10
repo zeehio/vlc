@@ -201,6 +201,7 @@ struct intf_sys_t
 
     int httpd_file_fill( uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data );
     void setSubtitle( char *psz_webvtt );
+    void requestReload();
     int httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
                            const httpd_message_t *query );
     void interrupt_wake_up();
@@ -253,6 +254,7 @@ private:
     static void set_meta(void*, vlc_meta_t *p_meta);
     static void set_input_length(void*, vlc_tick_t length);
     static void set_subtitle(void*, char *psz_webvtt);
+    static void reload(void*);
 
     void prepareHttpArtwork();
 
