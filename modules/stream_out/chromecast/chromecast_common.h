@@ -72,6 +72,17 @@ typedef struct
 
     void (*pf_set_input_length)(void*, vlc_tick_t length);
 
+    /**
+     * Hand over a WebVTT subtitle track to be served as a sidecar HTTP
+     * resource and rendered by the Chromecast receiver itself, instead of
+     * being burned into the video.
+     *
+     * \param psz_webvtt heap-allocated, NUL-terminated WebVTT document.
+     *                   Ownership is transferred to the callee, which must
+     *                   free() it. NULL clears any previously set subtitle.
+     */
+    void (*pf_set_subtitle)(void *, char *psz_webvtt);
+
 } chromecast_common;
 
 # ifdef __cplusplus

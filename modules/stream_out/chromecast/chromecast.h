@@ -69,6 +69,11 @@ static const std::string NAMESPACE_RECEIVER         = "urn:x-cast:com.google.cas
 // Media player Chromecast app id
 #define APP_ID "CC1AD845" // Default media player aka DEFAULT_MEDIA_RECEIVER_APPLICATION_ID
 
+/* There is only ever one sidecar subtitle track offered at a time, so a
+ * fixed trackId is fine (Cast trackIds only need to be unique within a
+ * single LOAD request). */
+#define CC_SUBTITLE_TRACK_ID 1
+
 enum States
 {
     // An authentication request has been sent
@@ -122,7 +127,8 @@ public:
     unsigned msgReceiverClose(const std::string& destinationId);
     unsigned msgAuth();
     unsigned msgPlayerLoad( const std::string& destinationId,
-                            const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
+                            const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
+                            const std::string& subtitleUrl );
     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
@@ -143,7 +149,8 @@ private:
                      const std::string & destinationId = DEFAULT_CHOMECAST_RECEIVER,
                      castchannel::CastMessage_PayloadType payloadType = castchannel::CastMessage_PayloadType_STRING);
     int pushMediaPlayerMessage( const std::string& destinationId, const std::stringstream & payload );
-    std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
+    std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
+                          const std::string& subtitleUrl );
     unsigned getNextReceiverRequestId();
     unsigned getNextRequestId();
 
@@ -188,10 +195,14 @@ struct intf_sys_t
     unsigned int getHttpStreamPort() const;
     std::string getHttpStreamPath() const;
     std::string getHttpArtRoot() const;
+    std::string getHttpSubtitlePath() const;
 
     std::string getDeviceName() const { return m_device_name; };
 
     int httpd_file_fill( uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data );
+    void setSubtitle( char *psz_webvtt );
+    int httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
+                           const httpd_message_t *query );
     void interrupt_wake_up();
     void preservePlaybackOnTeardown();
 private:
@@ -241,6 +252,7 @@ private:
 
     static void set_meta(void*, vlc_meta_t *p_meta);
     static void set_input_length(void*, vlc_tick_t length);
+    static void set_subtitle(void*, char *psz_webvtt);
 
     void prepareHttpArtwork();
 
@@ -302,6 +314,9 @@ private:
     std::string       m_art_http_ip;
     char             *m_art_url;
     unsigned          m_art_idx;
+
+    httpd_url_t      *m_subtitle_url;
+    char             *m_subtitle_webvtt;
 
     vlc_tick_t        m_cc_time_last_request_date;
     vlc_tick_t        m_cc_time_date;

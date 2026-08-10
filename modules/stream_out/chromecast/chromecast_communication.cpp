@@ -305,7 +305,8 @@ std::string ChromecastCommunication::getServerBaseURL() const
 
 std::string ChromecastCommunication::GetMedia( const std::string& mime,
                                                const vlc_meta_t *p_meta,
-                                               vlc_tick_t input_length )
+                                               vlc_tick_t input_length,
+                                               const std::string& subtitleUrl )
 {
     std::stringstream ss;
 
@@ -381,7 +382,7 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
     ss << "\"contentId\":\"" << chromecast_url << "\""
        << ",\"streamType\":\"" << stream_type << "\""
        << ",\"contentType\":\"" << mime << "\"";
-       
+
     if( is_buffered )
     {
         std::stringstream duration;
@@ -390,17 +391,35 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
         ss << ",\"duration\":" << duration.str();
     }
 
+    if( !subtitleUrl.empty() )
+    {
+        /* Sidecar text track: rendered by the Cast receiver itself instead
+         * of being burned into the video. Only text tracks are supported by
+         * the Styled/Default Media Receiver without a custom receiver app. */
+        ss << ",\"tracks\":[{"
+           <<   "\"trackId\":" << CC_SUBTITLE_TRACK_ID << ","
+           <<   "\"type\":\"TEXT\","
+           <<   "\"subtype\":\"SUBTITLES\","
+           <<   "\"trackContentId\":\"" << escape_json( subtitleUrl ) << "\","
+           <<   "\"trackContentType\":\"text/vtt\","
+           <<   "\"name\":\"" << escape_json( _("Subtitles") ) << "\""
+           << "}]";
+    }
+
     return ss.str();
 }
 
 unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
-                                             const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length )
+                                             const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
+                                             const std::string& subtitleUrl )
 {
     unsigned id = getNextRequestId();
     std::stringstream ss;
     ss << "{\"type\":\"LOAD\","
-       <<  "\"media\":{" << GetMedia( mime, p_meta, input_length ) << "},"
-       <<  "\"requestId\":" << id
+       <<  "\"media\":{" << GetMedia( mime, p_meta, input_length, subtitleUrl ) << "},";
+    if( !subtitleUrl.empty() )
+        ss << "\"activeTrackIds\":[" << CC_SUBTITLE_TRACK_ID << "],";
+    ss <<  "\"requestId\":" << id
        << "}";
 
     return pushMediaPlayerMessage( destinationId, ss ) == VLC_SUCCESS ? id : kInvalidId;
