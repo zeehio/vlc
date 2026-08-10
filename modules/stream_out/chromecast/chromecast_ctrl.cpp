@@ -155,6 +155,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_pause_state  = set_pause_state;
     m_common.pf_set_meta         = set_meta;
     m_common.pf_set_subtitle     = set_subtitle;
+    m_common.pf_reload           = reload;
 
     m_subtitle_url = httpd_UrlNew( m_httpd.m_host, getHttpSubtitlePath().c_str(), NULL, NULL );
     if( m_subtitle_url != NULL )
@@ -337,6 +338,44 @@ void intf_sys_t::set_subtitle( void *data, char *psz_webvtt )
 {
     intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
     p_sys->setSubtitle( psz_webvtt );
+}
+
+/**
+ * Re-sends a LOAD message for the media that is already playing, so the
+ * receiver re-fetches its sidecar text track (see pf_reload's doc in
+ * chromecast_common.h for why this is necessary). This mirrors setHasInput,
+ * minus the parts that only make sense for genuinely new content (mime
+ * type, artwork).
+ */
+void intf_sys_t::requestReload()
+{
+    vlc_mutex_locker locker( &m_lock );
+
+    if( m_state == Dead || m_mime.empty() )
+        return;
+
+    std::queue<QueueableMessages> empty;
+    std::swap( m_msgQueue, empty );
+
+    m_request_stop = false;
+    m_played_once = false;
+    m_paused = false;
+    m_cc_eof = false;
+    m_request_load = true;
+    m_cc_time_last_request_date = VLC_TICK_INVALID;
+    m_cc_time_date = VLC_TICK_INVALID;
+    m_cc_time = VLC_TICK_INVALID;
+    m_mediaSessionId = 0;
+
+    tryLoad();
+
+    vlc_cond_signal( &m_stateChangedCond );
+}
+
+void intf_sys_t::reload( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->requestReload();
 }
 
 int intf_sys_t::httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
