@@ -38,6 +38,7 @@
 #include "chromecast_common.h"
 
 #include <cassert>
+#include <cinttypes>
 #include <new>
 #include <string>
 
@@ -109,11 +110,17 @@ static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri )
     bool is_srt = HasExtension( psz_uri, "srt" );
     bool is_vtt = !is_srt && ( HasExtension( psz_uri, "vtt" ) || HasExtension( psz_uri, "webvtt" ) );
     if( !is_srt && !is_vtt )
+    {
+        msg_Dbg( p_obj, "cc subtitle load: %s has no srt/vtt/webvtt extension", psz_uri );
         return NULL;
+    }
 
     stream_t *s = vlc_stream_NewURL( p_obj, psz_uri );
     if( s == NULL )
+    {
+        msg_Warn( p_obj, "cc subtitle load: vlc_stream_NewURL failed for %s", psz_uri );
         return NULL;
+    }
 
     uint64_t size;
     /* Subtitle files are tiny; refuse anything unreasonable rather than
@@ -121,6 +128,7 @@ static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri )
     if( vlc_stream_GetSize( s, &size ) != VLC_SUCCESS || size == 0
      || size > INT64_C(4000000) )
     {
+        msg_Warn( p_obj, "cc subtitle load: bad size for %s (size=%" PRIu64 ")", psz_uri, size );
         vlc_stream_Delete( s );
         return NULL;
     }
@@ -136,9 +144,11 @@ static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri )
     vlc_stream_Delete( s );
     if( read <= 0 )
     {
+        msg_Warn( p_obj, "cc subtitle load: read failed for %s (read=%zd)", psz_uri, read );
         free( psz_data );
         return NULL;
     }
+    msg_Dbg( p_obj, "cc subtitle load: read %zd bytes from %s", read, psz_uri );
     psz_data[read] = '\0';
 
     char *psz_webvtt;
@@ -160,6 +170,7 @@ struct demux_cc
         :p_demux(demux)
         ,p_renderer(renderer)
         ,m_enabled( true )
+        ,m_subtitle_scanned( false )
     {
         init();
     }
@@ -208,7 +219,15 @@ struct demux_cc
         if (demux_Control( p_demux->p_next, DEMUX_GET_LENGTH, &m_length ) != VLC_SUCCESS)
             m_length = -1;
 
-        setSubtitleFromSlaves();
+        /* input_item_t's slave list is not populated yet at this point:
+         * Init() creates the master demux (and this filter along with it)
+         * before it calls LoadSlaves(), which is what actually fills
+         * pp_slaves (it clears it and rebuilds it, including auto-detected
+         * same-named subtitle files). Scanning here would always see an
+         * empty list, so it is deferred to the first Demux() call instead,
+         * which only runs once Init() (and therefore LoadSlaves()) has
+         * fully completed. */
+        m_subtitle_scanned = false;
 
         int i_current_title;
         if( demux_Control( p_demux->p_next, DEMUX_GET_TITLE,
@@ -277,14 +296,18 @@ struct demux_cc
     void setSubtitleFromSlaves()
     {
         std::string uri;
-        input_item_t *p_item = p_demux->p_next->p_input ?
-                               input_GetItem( p_demux->p_next->p_input ) : NULL;
+        input_thread_t *p_input = p_demux->p_next->p_input;
+        input_item_t *p_item = p_input ? input_GetItem( p_input ) : NULL;
+        msg_Dbg( p_demux, "cc subtitle scan: p_input=%p p_item=%p", (void*)p_input, (void*)p_item );
         if( p_item )
         {
             vlc_mutex_lock( &p_item->lock );
+            msg_Dbg( p_demux, "cc subtitle scan: i_slaves=%d", p_item->i_slaves );
             for( int i = 0; i < p_item->i_slaves; ++i )
             {
                 const input_item_slave_t *p_slave = p_item->pp_slaves[i];
+                msg_Dbg( p_demux, "cc subtitle scan: slave[%d] type=%d uri=%s",
+                        i, (int)p_slave->i_type, p_slave->psz_uri );
                 if( p_slave->i_type != SLAVE_TYPE_SPU )
                     continue;
                 /* Only plain SRT/WebVTT slaves can become a sidecar track;
@@ -296,12 +319,20 @@ struct demux_cc
                     uri = p_slave->psz_uri;
                     break;
                 }
+                else
+                    msg_Dbg( p_demux, "cc subtitle scan: slave[%d] extension not srt/vtt/webvtt, skipping", i );
             }
             vlc_mutex_unlock( &p_item->lock );
         }
 
+        if( uri.empty() )
+            msg_Dbg( p_demux, "cc subtitle scan: no matching external SRT/WebVTT slave found" );
+        else
+            msg_Dbg( p_demux, "cc subtitle scan: using slave uri=%s", uri.c_str() );
+
         char *psz_webvtt = uri.empty() ? NULL
                           : LoadSubtitleAsWebVTT( VLC_OBJECT(p_demux), uri.c_str() );
+        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s", psz_webvtt ? "generated" : "NULL (not set)" );
         p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );
     }
 
@@ -390,6 +421,12 @@ struct demux_cc
     {
         if ( !m_enabled )
             return demux_Demux( p_demux->p_next );
+
+        if( !m_subtitle_scanned )
+        {
+            m_subtitle_scanned = true;
+            setSubtitleFromSlaves();
+        }
 
         /* The CC sout is not pacing, so we pace here */
         int pace = p_renderer->pf_pace( p_renderer->p_opaque );
@@ -603,6 +640,7 @@ protected:
     vlc_tick_t    m_length;
     bool          m_can_seek;
     bool          m_enabled;
+    bool          m_subtitle_scanned;
     bool          m_demux_eof;
     double        m_start_pos;
     double        m_last_pos;
