@@ -31,13 +31,16 @@
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
+#include <vlc_input_item.h>
 
 #include "chromecast_common.h"
+#include "chromecast_webvtt.h"
 
 #include <cassert>
 #include <cinttypes>
 #include <cstring>
 #include <new>
+#include <string>
 
 static void on_paused_changed_cb(void *data, bool paused);
 
@@ -47,6 +50,8 @@ struct demux_cc
         :p_demux(demux)
         ,p_renderer(renderer)
         ,m_enabled( true )
+        ,m_subtitle_scanned( false )
+        ,m_subtitle_loaded_once( false )
     {
         init();
     }
@@ -188,6 +193,21 @@ struct demux_cc
             free( psz_real_demux );
         }
 
+        /* input_item_t's slave list is not populated yet at this point:
+         * Init() creates the master demux (and this filter along with it)
+         * before it calls LoadSlaves(), which is what actually fills
+         * pp_slaves (it clears it and rebuilds it, including auto-detected
+         * same-named subtitle files). Scanning here would always see an
+         * empty list, so it is deferred to the first Demux() call instead,
+         * which only runs once Init() (and therefore LoadSlaves()) has
+         * fully completed. */
+        m_subtitle_scanned = false;
+        /* This is a fresh casting session (or the demux filter was just
+         * re-enabled): its own initial LOAD, sent by the caller, will pick
+         * up whatever the upcoming scan sets, so no explicit reload should
+         * be requested for it. */
+        m_subtitle_loaded_once = false;
+
         int i_current_title;
         if( demux_Control( p_demux->s, DEMUX_GET_TITLE,
                            &i_current_title ) == VLC_SUCCESS )
@@ -238,7 +258,85 @@ struct demux_cc
         assert(p_renderer);
         p_renderer->pf_set_meta( p_renderer->p_opaque, NULL );
         p_renderer->pf_set_input_length( p_renderer->p_opaque, VLC_TICK_INVALID );
+        p_renderer->pf_set_subtitle( p_renderer->p_opaque, NULL );
         p_renderer->pf_set_demux_enabled(p_renderer->p_opaque, false, NULL, NULL);
+    }
+
+    /**
+     * Look for an external SRT/WebVTT subtitle slave on the input item and,
+     * if found, hand it over as a Cast sidecar text track. Only external
+     * slaves are considered (not embedded tracks): this is the only case
+     * where the whole subtitle content is available upfront, which a sidecar
+     * track needs since it is fetched once by the Cast receiver rather than
+     * streamed incrementally. Re-evaluated each time this demux filter is
+     * (re)enabled, so subtitles added before a cast starts are picked up;
+     * slaves added while already casting need a session restart to appear.
+     */
+    void setSubtitleFromSlaves()
+    {
+        std::string uri;
+        input_item_t *p_item = p_demux->s->p_input_item;
+        msg_Dbg( p_demux, "cc subtitle scan: p_item=%p", (void*)p_item );
+        if( p_item )
+        {
+            vlc_mutex_lock( &p_item->lock );
+            msg_Dbg( p_demux, "cc subtitle scan: i_slaves=%d", p_item->i_slaves );
+            for( int i = 0; i < p_item->i_slaves; ++i )
+            {
+                const input_item_slave_t *p_slave = p_item->pp_slaves[i];
+                msg_Dbg( p_demux, "cc subtitle scan: slave[%d] type=%d uri=%s",
+                        i, (int)p_slave->i_type, p_slave->psz_uri );
+                if( p_slave->i_type != SLAVE_TYPE_SPU )
+                    continue;
+                /* Take the first external SPU slave; whether it can
+                 * actually become a sidecar track is for the subtitle
+                 * demux/decode/encode chain below to decide; it already
+                 * has to fail gracefully for embedded/unsupported formats,
+                 * so there is no format allowlist to maintain here. */
+                uri = p_slave->psz_uri;
+                break;
+            }
+            vlc_mutex_unlock( &p_item->lock );
+        }
+
+        if( uri.empty() )
+            msg_Dbg( p_demux, "cc subtitle scan: no external SPU slave found" );
+        else
+            msg_Dbg( p_demux, "cc subtitle scan: using slave uri=%s", uri.c_str() );
+
+        vlc_tick_t offset = 0;
+        if( !uri.empty()
+         && demux_Control( p_demux->s, DEMUX_GET_TIME, &offset ) != VLC_SUCCESS )
+            offset = 0;
+
+        char *psz_webvtt = uri.empty() ? NULL
+                          : chromecast_ConvertSubtitleFileToWebVTT( VLC_OBJECT(p_demux),
+                                                                    uri.c_str(), offset );
+        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms)",
+                psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ) );
+        p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );
+
+        if( psz_webvtt != NULL )
+        {
+            /* The Cast protocol only fetches a sidecar text track once, at
+             * LOAD time, and never refreshes it on its own (the media is
+             * declared as a LIVE stream, which has no notion of seeking:
+             * VLC implements seeking locally and just keeps feeding the
+             * same connection from a new position). The very first time
+             * this runs, the initial LOAD triggered by the caller already
+             * picks up what was just set above; on every subsequent call
+             * (a seek re-triggered the scan) the receiver is still showing
+             * cues generated for the previous segment, so force a fresh
+             * LOAD to make it re-fetch what was just regenerated. */
+            if( m_subtitle_loaded_once )
+            {
+                msg_Dbg( p_demux, "cc subtitle scan: requesting a reload so the "
+                        "receiver re-fetches the regenerated sidecar track" );
+                p_renderer->pf_reload( p_renderer->p_opaque );
+            }
+            else
+                m_subtitle_loaded_once = true;
+        }
     }
 
     void resetTimes()
@@ -351,6 +449,12 @@ struct demux_cc
     {
         if ( !m_enabled )
             return demux_Demux( p_demux->s );
+
+        if( !m_subtitle_scanned )
+        {
+            m_subtitle_scanned = true;
+            setSubtitleFromSlaves();
+        }
 
         /* The CC sout is not pacing, so we pace here */
         int pace = p_renderer->pf_pace( p_renderer->p_opaque );
@@ -489,6 +593,11 @@ struct demux_cc
 
             resetTimes();
             resetDemuxEof();
+            /* The segment the receiver is about to be fed starts at a new
+             * position: re-run the subtitle scan on the next Demux() call
+             * so the sidecar track (if any) gets regenerated for it and
+             * the receiver is told to reload. */
+            m_subtitle_scanned = false;
             return VLC_SUCCESS;
         }
         case DEMUX_SET_TIME:
@@ -506,6 +615,7 @@ struct demux_cc
 
             resetTimes();
             resetDemuxEof();
+            m_subtitle_scanned = false;
             return VLC_SUCCESS;
         }
         case DEMUX_SET_PAUSE_STATE:
@@ -527,6 +637,7 @@ struct demux_cc
             seekBack(m_last_time, m_last_pos);
             resetTimes();
             resetDemuxEof();
+            m_subtitle_scanned = false;
             break;
         case DEMUX_FILTER_ENABLE:
             p_renderer = static_cast<chromecast_common *>(
@@ -560,6 +671,8 @@ protected:
     vlc_tick_t    m_length;
     bool          m_can_seek;
     bool          m_enabled;
+    bool          m_subtitle_scanned;
+    bool          m_subtitle_loaded_once;
     bool          m_demux_eof;
     double        m_start_pos;
     double        m_last_pos;

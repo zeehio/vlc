@@ -117,6 +117,9 @@ static void source_cb_error( httpd_message_t *answer, int i_status )
     httpd_MsgAdd( answer, "Connection", "close" );
 }
 
+static int httpd_subtitle_cb_wrapper( httpd_callback_sys_t *data, httpd_client_t *cl,
+                                      httpd_message_t *answer, const httpd_message_t *query );
+
 static const char* StateToStr( States s )
 {
     switch (s )
@@ -190,6 +193,8 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_eligibility_decided(false)
  , m_source_httpd_url(NULL)
  , m_start_time( VLC_TICK_INVALID )
+ , m_subtitle_url(NULL)
+ , m_subtitle_webvtt(NULL)
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
  , m_pingRetriesLeft( PING_WAIT_RETRIES )
@@ -225,6 +230,8 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_seek             = seek_source;
     m_common.pf_is_eligibility_decided = is_eligibility_decided;
     m_common.pf_set_start_time   = set_start_time;
+    m_common.pf_set_subtitle     = set_subtitle;
+    m_common.pf_reload           = reload;
 
     m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
     if( m_source_httpd_url != NULL )
@@ -232,6 +239,13 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
                         (httpd_callback_sys_t *) this );
     else
         msg_Warn( p_this, "failed to register the Chromecast direct-source URL" );
+
+    m_subtitle_url = httpd_UrlNew( m_httpd.m_host, getHttpSubtitlePath().c_str(), NULL, NULL );
+    if( m_subtitle_url != NULL )
+        httpd_UrlCatch( m_subtitle_url, HTTPD_MSG_GET, httpd_subtitle_cb_wrapper,
+                        (httpd_callback_sys_t *) this );
+    else
+        msg_Warn( p_this, "failed to register the Chromecast subtitle sidecar URL" );
 
     assert( var_Type( vlc_object_parent(vlc_object_parent(m_module)), CC_SHARED_VAR_NAME) == 0 );
     if (var_Create( vlc_object_parent(vlc_object_parent(m_module)), CC_SHARED_VAR_NAME, VLC_VAR_ADDRESS ) == VLC_SUCCESS )
@@ -302,6 +316,11 @@ intf_sys_t::~intf_sys_t()
         vlc_stream_Delete( it->second->p_stream );
         delete it->second;
     }
+
+    if( m_subtitle_url )
+        httpd_UrlDelete( m_subtitle_url );
+
+    free( m_subtitle_webvtt );
 }
 
 void intf_sys_t::preservePlaybackOnTeardown()
@@ -544,6 +563,58 @@ void intf_sys_t::set_start_time( void *data, vlc_tick_t time )
     p_sys->setStartTime( time );
 }
 
+void intf_sys_t::setSubtitle( char *psz_webvtt )
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    free( m_subtitle_webvtt );
+    m_subtitle_webvtt = psz_webvtt;
+}
+
+void intf_sys_t::set_subtitle( void *data, char *psz_webvtt )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setSubtitle( psz_webvtt );
+}
+
+/**
+ * Re-sends a LOAD message for the media that is already playing, so the
+ * receiver re-fetches its sidecar text track (see pf_reload's doc in
+ * chromecast_common.h for why this is necessary). This mirrors setHasInput,
+ * minus the parts that only make sense for genuinely new content (mime
+ * type, artwork).
+ */
+void intf_sys_t::requestReload()
+{
+    vlc::threads::mutex_locker locker( m_lock );
+
+    if( m_state == Dead || m_mime.empty() )
+        return;
+
+    std::queue<QueueableMessages> empty;
+    std::swap( m_msgQueue, empty );
+
+    m_request_stop = false;
+    m_played_once = false;
+    m_paused_once = false;
+    m_paused = false;
+    m_cc_eof = false;
+    m_request_load = true;
+    m_cc_time_last_request_date = VLC_TICK_INVALID;
+    m_cc_time_date = VLC_TICK_INVALID;
+    m_cc_time = VLC_TICK_INVALID;
+    m_mediaSessionId = 0;
+
+    tryLoad();
+
+    m_stateChangedCond.signal();
+}
+
+void intf_sys_t::reload( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->requestReload();
+}
+
 int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
                                  const httpd_message_t *query )
 {
@@ -690,11 +761,72 @@ int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
     return VLC_SUCCESS;
 }
 
+int intf_sys_t::httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
+                                   const httpd_message_t *query )
+{
+    if( !answer || !query || !cl )
+        return VLC_SUCCESS;
+
+    char *psz_webvtt;
+    {
+        vlc::threads::mutex_locker lock( m_lock );
+        if( m_subtitle_webvtt == NULL )
+        {
+            answer->i_proto  = HTTPD_PROTO_HTTP;
+            answer->i_version= 0;
+            answer->i_type   = HTTPD_MSG_ANSWER;
+            answer->i_status = 404;
+            answer->i_body   = 0;
+            httpd_MsgAdd( answer, "Content-Length", "0" );
+            httpd_MsgAdd( answer, "Connection", "close" );
+            return VLC_SUCCESS;
+        }
+        psz_webvtt = strdup( m_subtitle_webvtt );
+    }
+    if( unlikely(psz_webvtt == NULL) )
+        return VLC_EGENERIC;
+
+    answer->i_proto  = HTTPD_PROTO_HTTP;
+    answer->i_version= 0;
+    answer->i_type   = HTTPD_MSG_ANSWER;
+    answer->i_status = 200;
+
+    httpd_MsgAdd( answer, "Content-type", "text/vtt; charset=utf-8" );
+    httpd_MsgAdd( answer, "Cache-Control", "no-cache" );
+    /* Required by the Cast receiver: sidecar text tracks are fetched by the
+     * receiver's own origin, not VLC's, so this resource (and the main
+     * media resource) must allow cross-origin reads. */
+    httpd_MsgAdd( answer, "Access-Control-Allow-Origin", "*" );
+
+    if( query->i_type != HTTPD_MSG_HEAD )
+    {
+        answer->p_body = (uint8_t *)psz_webvtt;
+        answer->i_body = strlen( psz_webvtt );
+    }
+    else
+    {
+        free( psz_webvtt );
+        answer->i_body = 0;
+    }
+
+    httpd_MsgAdd( answer, "Connection", "close" );
+    httpd_MsgAdd( answer, "Content-Length", "%zu", answer->i_body );
+
+    return VLC_SUCCESS;
+}
+
 static int httpd_source_cb_wrapper( httpd_callback_sys_t *data, httpd_client_t *cl,
                                     httpd_message_t *answer, const httpd_message_t *query )
 {
     intf_sys_t *p_sys = static_cast<intf_sys_t*>((void *)data);
     return p_sys->httpd_source_cb( cl, answer, query );
+}
+
+static int httpd_subtitle_cb_wrapper( httpd_callback_sys_t *data, httpd_client_t *cl,
+                                      httpd_message_t *answer, const httpd_message_t *query )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>((void *)data);
+    return p_sys->httpd_subtitle_cb( cl, answer, query );
 }
 
 void intf_sys_t::prepareHttpArtwork()
@@ -786,11 +918,15 @@ void intf_sys_t::tryLoad()
         m_start_time = VLC_TICK_INVALID;
     }
 
+    std::string subtitleUrl;
+    if( m_subtitle_webvtt != NULL )
+        subtitleUrl = m_art_http_ip + getHttpSubtitlePath();
+
     // Reset the mediaSessionID to allow the new session to become the current one.
     // we cannot start a new load when the last one is still processing
     m_last_request_id =
         m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, m_input_length,
-                                        contentPath, startTime );
+                                        subtitleUrl, contentPath, startTime );
     if( m_last_request_id != ChromecastCommunication::kInvalidId )
         m_state = Loading;
 }
@@ -1583,6 +1719,11 @@ unsigned int intf_sys_t::getHttpStreamPort() const
 std::string intf_sys_t::getHttpStreamPath() const
 {
     return m_httpd.m_root + "/stream";
+}
+
+std::string intf_sys_t::getHttpSubtitlePath() const
+{
+    return m_httpd.m_root + "/subtitle.vtt";
 }
 
 std::string intf_sys_t::getHttpArtRoot() const

@@ -137,6 +137,27 @@ typedef struct
      */
     void (*pf_set_audio_track_count)(void *, unsigned count);
 
+    /**
+     * Hand over a WebVTT subtitle track to be served as a sidecar HTTP
+     * resource and rendered by the Chromecast receiver itself, instead of
+     * being burned into the video.
+     *
+     * \param psz_webvtt heap-allocated, NUL-terminated WebVTT document.
+     *                   Ownership is transferred to the callee, which must
+     *                   free() it. NULL clears any previously set subtitle.
+     */
+    void (*pf_set_subtitle)(void *, char *psz_webvtt);
+
+    /**
+     * Ask for the current media to be reloaded on the receiver (a fresh
+     * LOAD message reusing the same content). The Cast protocol only
+     * fetches sidecar text tracks once, at LOAD time, and the media here
+     * is declared as a LIVE stream (no built-in seeking), so this is the
+     * only way to make the receiver pick up a track that was just updated
+     * via pf_set_subtitle after the session already started.
+     */
+    void (*pf_reload)(void *);
+
 } chromecast_common;
 
 # ifdef __cplusplus

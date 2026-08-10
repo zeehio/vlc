@@ -240,3 +240,18 @@ vlc_tests += {
     'link_with' : [libvlc, libvlccore],
     'module_depends' : vlc_plugins_targets.keys()
 }
+
+# Exercises the real subtitle demux/decode/encode/mux chain (see
+# chromecast_webvtt.cpp's header comment for why), so unlike most small
+# unit tests this one genuinely needs libvlc plus the plugins that chain
+# is made of.
+vlc_tests += {
+    'name' : 'test_modules_stream_out_chromecast_webvtt',
+    'sources' : files(
+        'stream_out/chromecast_webvtt.cpp',
+        '../../modules/stream_out/chromecast/chromecast_webvtt.cpp',
+        '../../modules/stream_out/chromecast/chromecast_webvtt.h'),
+    'suite' : ['modules', 'test_modules'],
+    'link_with' : [libvlc, libvlccore],
+    'module_depends' : ['subtitle', 'subsdec', 'libass', 'webvtt'],
+}
