@@ -286,7 +286,8 @@ static std::string meta_get_escaped(const vlc_meta_t *p_meta, vlc_meta_type_t ty
 std::string ChromecastCommunication::GetMedia( const std::string& mime,
                                                const vlc_meta_t *p_meta,
                                                const std::string& subtitleUrl,
-                                               vlc_tick_t i_duration )
+                                               vlc_tick_t i_duration,
+                                               const std::string& contentPath )
 {
     std::stringstream ss;
 
@@ -347,21 +348,21 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
     }
 
     std::stringstream chromecast_url;
-    chromecast_url << "http://" << m_serverIp << ":" << m_serverPort << m_serverPath;
+    chromecast_url << "http://" << m_serverIp << ":" << m_serverPort
+                   << ( contentPath.empty() ? m_serverPath : contentPath );
 
     msg_Dbg( m_module, "s_chromecast_url: %s", chromecast_url.str().c_str());
 
     ss << "\"contentId\":\"" << chromecast_url.str() << "\""
        << ",\"contentType\":\"" << mime << "\"";
 
-    /* A known duration (i.e. anything but a live capture source such as a
-     * webcam) is declared as "BUFFERED" with that duration, rather than
-     * "LIVE": this is what makes the receiver offer a seek bar and honor
-     * remote/touch seek gestures at all. There is no seekable index behind
-     * this contentId yet - this is step one of enabling receiver-driven
-     * seeking, evaluating whether/how the receiver reacts before building
-     * that index. */
-    if( i_duration > 0 )
+    /* Only declare "BUFFERED" (with a real duration, unlocking the
+     * receiver's native seek bar and remote/touch seek gestures) when
+     * contentId points at the direct-source endpoint: that's the only case
+     * where a real seekable container index sits behind it. Ordinary
+     * live-restream content has no such index - even though its duration
+     * may be known - so it must stay declared as "LIVE". */
+    if( i_duration > 0 && !contentPath.empty() )
     {
         double f_duration_sec = (double)i_duration / (double)CLOCK_FREQ;
         ss << ",\"streamType\":\"BUFFERED\""
@@ -390,12 +391,13 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
 
 unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
                                              const std::string& mime, const vlc_meta_t *p_meta,
-                                             const std::string& subtitleUrl, vlc_tick_t i_duration )
+                                             const std::string& subtitleUrl, vlc_tick_t i_duration,
+                                             const std::string& contentPath )
 {
     unsigned id = getNextRequestId();
     std::stringstream ss;
     ss << "{\"type\":\"LOAD\","
-       <<  "\"media\":{" << GetMedia( mime, p_meta, subtitleUrl, i_duration ) << "},";
+       <<  "\"media\":{" << GetMedia( mime, p_meta, subtitleUrl, i_duration, contentPath ) << "},";
     if( !subtitleUrl.empty() )
         ss << "\"activeTrackIds\":[" << CC_SUBTITLE_TRACK_ID << "],";
     ss <<  "\"autoplay\":\"false\","
@@ -441,6 +443,22 @@ unsigned ChromecastCommunication::msgPlayerPause( const std::string& destination
     std::stringstream ss;
     ss << "{\"type\":\"PAUSE\","
        <<  "\"mediaSessionId\":" << mediaSessionId << ","
+       <<  "\"requestId\":" << id
+       << "}";
+
+    return pushMediaPlayerMessage( destinationId, ss ) == VLC_SUCCESS ? id : kInvalidId;
+}
+
+unsigned ChromecastCommunication::msgPlayerSeek( const std::string& destinationId, int64_t mediaSessionId,
+                                                  const std::string & currentTime )
+{
+    assert(mediaSessionId != 0);
+    unsigned id = getNextRequestId();
+
+    std::stringstream ss;
+    ss << "{\"type\":\"SEEK\","
+       <<  "\"mediaSessionId\":" << mediaSessionId << ","
+       <<  "\"currentTime\":" << currentTime << ","
        <<  "\"requestId\":" << id
        << "}";
 

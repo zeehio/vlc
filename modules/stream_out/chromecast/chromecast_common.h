@@ -100,6 +100,34 @@ typedef struct
      */
     void (*pf_set_input_length)(void *, vlc_tick_t length);
 
+    /**
+     * Report the original source of the media being cast, as known by the
+     * local demux: its URL (so a direct-serve HTTP endpoint can open the
+     * same resource) and the name of the demux module that recognized it
+     * (e.g. "mp4", "webm" - so we can tell whether the source container is
+     * already Chromecast-compatible). Called once, before playback starts.
+     */
+    void (*pf_set_source_info)(void *, const char *psz_url, const char *psz_demux,
+                               bool b_can_seek);
+
+    /**
+     * True while the receiver is playing the source directly (see
+     * pf_set_source_info / the Tier-1 direct-serve path): the demux filter
+     * uses this to source local playback position from the receiver's own
+     * (polled) absolute position instead of the segment-relative timing
+     * used by the live-restream path, and to redirect local seeks to
+     * pf_seek instead of seeking the local demux.
+     */
+    bool (*pf_is_source_direct)(void *);
+
+    /**
+     * Ask the receiver to seek to an absolute position in the media
+     * (Tier-1 only: the receiver has a real, complete index to seek
+     * against). Returns false if no request could be sent (e.g. no active
+     * media session yet).
+     */
+    bool (*pf_seek)(void *, vlc_tick_t time);
+
 } chromecast_common;
 
 # ifdef __cplusplus

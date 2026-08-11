@@ -38,6 +38,7 @@
 #include <atomic>
 #include <sstream>
 #include <queue>
+#include <map>
 
 #ifndef PROTOBUF_INLINE_NOT_IN_HEADERS
 # define PROTOBUF_INLINE_NOT_IN_HEADERS 0
@@ -126,7 +127,8 @@ public:
     unsigned msgAuth();
     unsigned msgPlayerLoad( const std::string& destinationId,
                             const std::string& mime, const vlc_meta_t *p_meta,
-                            const std::string& subtitleUrl, vlc_tick_t i_duration );
+                            const std::string& subtitleUrl, vlc_tick_t i_duration,
+                            const std::string& contentPath = std::string() );
     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
@@ -150,7 +152,8 @@ private:
                      castchannel::CastMessage_PayloadType payloadType = castchannel::CastMessage_PayloadType_STRING);
     int pushMediaPlayerMessage( const std::string& destinationId, const std::stringstream & payload );
     std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta,
-                          const std::string& subtitleUrl, vlc_tick_t i_duration );
+                          const std::string& subtitleUrl, vlc_tick_t i_duration,
+                          const std::string& contentPath );
     unsigned getNextReceiverRequestId();
     unsigned getNextRequestId();
 
@@ -196,6 +199,7 @@ struct intf_sys_t
     std::string getHttpStreamPath() const;
     std::string getHttpArtRoot() const;
     std::string getHttpSubtitlePath() const;
+    std::string getHttpSourcePath() const;
 
     std::string getDeviceName() const { return m_device_name; };
 
@@ -203,8 +207,37 @@ struct intf_sys_t
     void setSubtitle( char *psz_webvtt );
     void requestReload();
     void setInputLength( vlc_tick_t length );
+    vlc_tick_t getInputLength() const;
+    void setSourceInfo( const char *psz_url, const char *psz_demux, bool b_can_seek );
+    std::string getSourceUrl() const;
+    std::string getSourceDemux() const;
+    bool getSourceCanSeek() const;
+
+    /**
+     * Tier-1: the receiver is being pointed directly at the original
+     * source bytes (served as-is, Range-capable, through
+     * getHttpSourcePath()) instead of the live-restream transcode/mux
+     * chain, because the source is already a Chromecast-compatible,
+     * finite, seekable file. Set once by cast.cpp when it decides whether
+     * a session is eligible; read by the demux-filter to decide whether
+     * local playback position/seeking should defer to the receiver.
+     */
+    void setSourceDirect( bool active, const std::string &mime );
+    bool isSourceDirect() const;
+    std::string getSourceMime() const;
+    bool seekSource( vlc_tick_t time );
     int httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
                            const httpd_message_t *query );
+    /**
+     * Serve the original (untranscoded) source media bytes as-is over
+     * HTTP, honoring Range requests, for Tier-1 sessions where the source
+     * is already Chromecast-compatible: this lets the receiver use its
+     * native seeking against the source's own container index instead of
+     * going through the live-restream transcode/mux chain, which has no
+     * seekable index at all.
+     */
+    int httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
+                         const httpd_message_t *query );
     void interrupt_wake_up();
 private:
     void reinit();
@@ -254,6 +287,9 @@ private:
     static void set_subtitle(void*, char *psz_webvtt);
     static void reload(void*);
     static void set_input_length(void*, vlc_tick_t length);
+    static void set_source_info(void*, const char *psz_url, const char *psz_demux, bool b_can_seek);
+    static bool is_source_direct(void*);
+    static bool seek_source(void*, vlc_tick_t time);
 
     void prepareHttpArtwork();
 
@@ -317,6 +353,15 @@ private:
     httpd_url_t      *m_subtitle_url;
     char             *m_subtitle_webvtt;
     vlc_tick_t        m_input_length;
+    std::string       m_source_url;
+    std::string       m_source_demux;
+    bool              m_source_can_seek;
+    std::string       m_source_mime;
+    bool              m_source_direct;
+
+    struct SourceStreamClient;
+    httpd_url_t                                    *m_source_httpd_url;
+    std::map<httpd_client_t *, SourceStreamClient *> m_source_clients;
 
     vlc_tick_t        m_cc_time_last_request_date;
     vlc_tick_t        m_cc_time_date;

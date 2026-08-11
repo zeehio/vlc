@@ -97,6 +97,7 @@ struct sout_stream_sys_t
         , transcoding_state( TRANSCODING_NONE )
         , venc_opt_idx ( -1 )
         , out_streams_added( 0 )
+        , tier1_active( false )
     {
         assert(p_intf != NULL);
         vlc_mutex_init(&lock);
@@ -147,6 +148,11 @@ struct sout_stream_sys_t
     std::vector<sout_stream_id_sys_t*> streams;
     std::vector<sout_stream_id_sys_t*> out_streams;
     unsigned int                       out_streams_added;
+
+    /* Tier-1: this session serves the original source bytes directly
+     * (see intf_sys_t::setSourceDirect) instead of going through the
+     * transcode/mux chain below. Send() drops blocks unread in this mode. */
+    bool                                tier1_active;
 
 private:
     std::string GetVencOption( sout_stream_t *, vlc_fourcc_t *,
@@ -762,6 +768,11 @@ static void DelInternal(sout_stream_t *p_stream, sout_stream_id_sys_t *id,
         p_sys->p_intf->requestPlayerStop();
         p_sys->access_out_live.clear();
         p_sys->transcoding_state = TRANSCODING_NONE;
+        if ( p_sys->tier1_active )
+        {
+            p_sys->tier1_active = false;
+            p_sys->p_intf->setSourceDirect( false, std::string() );
+        }
     }
 }
 
@@ -1205,6 +1216,57 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
 
     out_force_reload = false;
 
+    /* Tier 1: if the source is already a finite, seekable, Chromecast-
+     * compatible file (canRemux, plus a container the receiver can index
+     * itself), skip the transcode/mux chain entirely and point the
+     * receiver at the source's own bytes. This gives it a real container
+     * index to seek against, unlike the live-restream chain below, which
+     * has none. */
+    bool b_tier1 = false;
+    std::string tier1_mime;
+    if ( canRemux )
+    {
+        std::string source_demux = p_intf->getSourceDemux();
+        if ( ( source_demux == "mp4" || source_demux == "mkv" )
+          && p_intf->getSourceCanSeek()
+          && p_intf->getInputLength() > 0
+          && !p_intf->getSourceUrl().empty() )
+        {
+            const bool b_source_webm = ( i_codec_audio == VLC_CODEC_VORBIS ||
+                                        i_codec_audio == VLC_CODEC_OPUS ) &&
+                                       ( i_codec_video == VLC_CODEC_VP8 ||
+                                        i_codec_video == VLC_CODEC_VP9 );
+            b_tier1 = true;
+            if ( source_demux == "mp4" )
+                tier1_mime = p_original_video ? "video/mp4" : "audio/mp4";
+            else
+                tier1_mime = b_source_webm
+                    ? ( p_original_video ? "video/webm" : "audio/webm" )
+                    : ( p_original_video ? "video/x-matroska" : "audio/x-matroska" );
+        }
+    }
+
+    if ( b_tier1 )
+    {
+        stopSoutChain( p_stream );
+        access_out_live.clear();
+        out_streams = new_streams;
+        tier1_active = true;
+        mime = tier1_mime;
+        p_intf->setSourceDirect( true, tier1_mime );
+        p_intf->setRetryOnFail( false );
+        p_intf->setHasInput( tier1_mime );
+        return true;
+    }
+
+    if ( tier1_active )
+    {
+        /* No longer eligible (e.g. the track set changed): fall back to
+         * the normal transcode/live-restream path below. */
+        tier1_active = false;
+        p_intf->setSourceDirect( false, std::string() );
+    }
+
     std::stringstream ssout;
     int new_transcoding_state = TRANSCODING_NONE;
     if ( !canRemux )
@@ -1332,6 +1394,14 @@ static int Send(sout_stream_t *p_stream, sout_stream_id_sys_t *id,
     }
 
     sout_stream_id_sys_t *next_id = p_sys->GetSubId( p_stream, id );
+
+    if ( p_sys->tier1_active )
+    {
+        /* The receiver reads the source directly; nothing to forward. */
+        block_Release( p_buffer );
+        return VLC_SUCCESS;
+    }
+
     if ( next_id == NULL )
     {
         block_Release( p_buffer );

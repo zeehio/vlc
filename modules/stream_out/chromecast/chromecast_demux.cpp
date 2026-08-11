@@ -100,6 +100,18 @@ struct demux_cc
             m_length = -1;
         p_renderer->pf_set_input_length( p_renderer->p_opaque, m_length );
 
+        {
+            /* p_next is the real upstream demuxer: its psz_demux is the
+             * name of the module that recognized the container (e.g.
+             * "mp4", "webm"), and its p_input gives us the original URL. */
+            input_thread_t *p_src_input = p_demux->p_next->p_input;
+            input_item_t *p_src_item = p_src_input ? input_GetItem( p_src_input ) : NULL;
+            char *psz_url = p_src_item ? input_item_GetURI( p_src_item ) : NULL;
+            p_renderer->pf_set_source_info( p_renderer->p_opaque, psz_url,
+                                            p_demux->p_next->psz_demux, m_can_seek );
+            free( psz_url );
+        }
+
         /* input_item_t's slave list is not populated yet at this point:
          * Init() creates the master demux (and this filter along with it)
          * before it calls LoadSlaves(), which is what actually fills
@@ -212,8 +224,15 @@ struct demux_cc
         else
             msg_Dbg( p_demux, "cc subtitle scan: using slave uri=%s", uri.c_str() );
 
+        /* Tier-1: the receiver plays (and seeks) the source's own absolute
+         * timeline directly, so the sidecar track must match the file's
+         * own timestamps as-is. The offset below only exists to compensate
+         * for the live-restream path always re-casting from "now": each
+         * "segment" the receiver gets starts at zero, so subtitle cues
+         * need to be shifted back by however far into the file that
+         * segment actually starts. */
         vlc_tick_t offset = 0;
-        if( !uri.empty()
+        if( !uri.empty() && !p_renderer->pf_is_source_direct( p_renderer->p_opaque )
          && demux_Control( p_demux->p_next, DEMUX_GET_TIME, &offset ) != VLC_SUCCESS )
             offset = 0;
 
@@ -290,6 +309,20 @@ struct demux_cc
 
     vlc_tick_t getTime()
     {
+        /* Tier-1: the receiver plays the source directly and knows its own
+         * absolute position in it, unlike the live-restream path below,
+         * where the receiver's own clock resets at the start of every
+         * segment and has to be added to the local position at that
+         * point. */
+        if( p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
+        {
+            vlc_tick_t cc_time = getCCTime();
+            if( cc_time == VLC_TICK_INVALID )
+                return -1;
+            m_last_time = cc_time;
+            return cc_time;
+        }
+
         if( m_start_time < 0 )
             return -1;
 
@@ -304,6 +337,17 @@ struct demux_cc
 
     double getPosition()
     {
+        if( p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
+        {
+            if( m_length <= 0 )
+                return -1;
+            vlc_tick_t cc_time = getCCTime();
+            if( cc_time == VLC_TICK_INVALID )
+                return -1;
+            m_last_pos = cc_time / double( m_length );
+            return m_last_pos;
+        }
+
         if( m_length >= 0 && m_start_pos >= 0 )
         {
             m_last_pos = ( getCCTime() / double( m_length ) ) + m_start_pos;
@@ -454,6 +498,19 @@ struct demux_cc
         case DEMUX_SET_POSITION:
         {
             double pos = va_arg( args, double );
+
+            if( p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
+            {
+                /* The receiver has the real index: let it seek itself
+                 * instead of seeking (and re-casting from) the local
+                 * demux. */
+                if( m_length <= 0 )
+                    return VLC_EGENERIC;
+                return p_renderer->pf_seek( p_renderer->p_opaque,
+                                            vlc_tick_t( pos * m_length ) )
+                       ? VLC_SUCCESS : VLC_EGENERIC;
+            }
+
             /* Force imprecise seek */
             int ret = demux_Control( p_demux->p_next, DEMUX_SET_POSITION, pos, false );
             if( ret != VLC_SUCCESS )
@@ -471,6 +528,11 @@ struct demux_cc
         case DEMUX_SET_TIME:
         {
             vlc_tick_t time = va_arg( args, int64_t );
+
+            if( p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
+                return p_renderer->pf_seek( p_renderer->p_opaque, time )
+                       ? VLC_SUCCESS : VLC_EGENERIC;
+
             /* Force imprecise seek */
             int ret = demux_Control( p_demux->p_next, DEMUX_SET_TIME, time, false );
             if( ret != VLC_SUCCESS )
