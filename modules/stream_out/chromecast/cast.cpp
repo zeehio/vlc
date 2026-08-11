@@ -735,23 +735,25 @@ static void DelInternal(sout_stream_t *p_stream, sout_stream_id_sys_t *id,
         sout_stream_id_sys_t *p_sys_id = *it;
         if ( p_sys_id == id )
         {
-            if ( p_sys_id->p_sub_id != NULL )
+            /* Also true for a Tier-1 stream, whose p_sub_id is always NULL
+             * (there is no p_out chain to add it to): it still needs to be
+             * dropped from out_streams here, or the pointer freed below
+             * would be left dangling in that vector. */
+            for (std::vector<sout_stream_id_sys_t*>::iterator out_it = p_sys->out_streams.begin();
+                 out_it != p_sys->out_streams.end(); )
             {
-                sout_StreamIdDel( p_sys->p_out, p_sys_id->p_sub_id );
-                for (std::vector<sout_stream_id_sys_t*>::iterator out_it = p_sys->out_streams.begin();
-                     out_it != p_sys->out_streams.end(); )
+                if (*out_it == id)
                 {
-                    if (*out_it == id)
-                    {
-                        p_sys->out_streams.erase(out_it);
-                        p_sys->es_changed = reset_config;
-                        p_sys->out_force_reload = reset_config;
-                        if( p_sys_id->fmt.i_cat == VIDEO_ES )
-                            p_sys->has_video = false;
-                        break;
-                    }
-                    out_it++;
+                    if ( p_sys_id->p_sub_id != NULL )
+                        sout_StreamIdDel( p_sys->p_out, p_sys_id->p_sub_id );
+                    p_sys->out_streams.erase(out_it);
+                    p_sys->es_changed = reset_config;
+                    p_sys->out_force_reload = reset_config;
+                    if( p_sys_id->fmt.i_cat == VIDEO_ES )
+                        p_sys->has_video = false;
+                    break;
                 }
+                out_it++;
             }
 
             es_format_Clean( &p_sys_id->fmt );
