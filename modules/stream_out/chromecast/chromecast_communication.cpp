@@ -53,8 +53,26 @@ ChromecastCommunication::ChromecastCommunication( vlc_object_t* p_module,
 
     /* Ignore ca checks */
     m_creds->obj.flags |= OBJECT_FLAGS_INSECURE;
-    m_tls = vlc_tls_SocketOpenTLS( m_creds, targetIP, devicePort, "tcps",
-                                   NULL, NULL );
+
+    /* The initial handshake to the Chromecast can fail transiently (seen
+     * in the wild as "Function was interrupted" immediately followed by
+     * "Resource temporarily unavailable" on retry) - throwing here aborts
+     * the whole sout, and VLC's response to that is to tear down and
+     * recreate the entire local input rather than just retrying the
+     * connection, which restarts local playback from scratch. A couple of
+     * retries here are far cheaper than that, and consistent with the
+     * observation that a fresh attempt shortly after typically succeeds. */
+    for( int i_attempt = 0; m_tls == NULL && i_attempt < 3; i_attempt++ )
+    {
+        if( i_attempt > 0 )
+        {
+            msg_Warn( m_module, "Chromecast TLS handshake failed, retrying "
+                     "(attempt %d/3)", i_attempt + 1 );
+            msleep( VLC_TICK_FROM_MS( 200 ) );
+        }
+        m_tls = vlc_tls_SocketOpenTLS( m_creds, targetIP, devicePort, "tcps",
+                                       NULL, NULL );
+    }
     if (m_tls == NULL)
     {
         vlc_tls_Delete(m_creds);
