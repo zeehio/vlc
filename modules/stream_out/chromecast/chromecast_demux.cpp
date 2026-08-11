@@ -419,16 +419,27 @@ struct demux_cc
 
         if( !m_subtitle_scanned )
         {
-            m_subtitle_scanned = true;
-            setSubtitleFromSlaves();
+            /* Wait for Tier-1 eligibility to be settled for the
+             * (now-fully-known) track set before the one-time scan,
+             * instead of scanning immediately and correcting later: a
+             * "scan now (possibly with the wrong offset), fix on the next
+             * call" approach means the receiver may fetch and start
+             * rendering a first, necessarily-wrong version of the sidecar
+             * before the corrected one replaces it - and there is no
+             * guarantee a reload actually clears cues already rendered
+             * from that first fetch, rather than layering the corrected
+             * ones on top of them. */
+            if( p_renderer->pf_is_eligibility_decided( p_renderer->p_opaque ) )
+            {
+                m_subtitle_scanned = true;
+                setSubtitleFromSlaves();
+            }
         }
         else if( m_subtitle_has_content
               && m_subtitle_scan_was_tier1 != p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
         {
-            /* The Tier-1 status used for the last scan's offset no longer
-             * matches reality (either it settled after that first,
-             * necessarily provisional scan, or it changed since - e.g. a
-             * track change flipped eligibility): regenerate the sidecar
+            /* Tier-1 status changed since the scan (e.g. a track change
+             * flipped eligibility mid-session): regenerate the sidecar
              * with the correct reference frame and reload the receiver. */
             setSubtitleFromSlaves();
         }

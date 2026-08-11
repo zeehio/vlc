@@ -128,6 +128,18 @@ typedef struct
      */
     bool (*pf_seek)(void *, vlc_tick_t time);
 
+    /**
+     * True once the source has been checked at least once for Tier-1
+     * eligibility (pf_is_source_direct() reflects a real answer, not just
+     * its not-yet-decided default). Tier-1 eligibility depends on every
+     * known track's codec, which is only settled once data has flowed
+     * through the sout chain at least once - before that,
+     * pf_is_source_direct() is always false, whether or not the session
+     * will end up being Tier-1. Code that needs to know the *real* answer
+     * (not a possibly-still-pending one) must wait for this first.
+     */
+    bool (*pf_is_eligibility_decided)(void *);
+
 } chromecast_common;
 
 # ifdef __cplusplus

@@ -1225,6 +1225,13 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
      * receiver at the source's own bytes. This gives it a real container
      * index to seek against, unlike the live-restream chain below, which
      * has none. */
+    /* Whatever this decides below (b_tier1 true, false, or unreachable
+     * because canRemux is false), the decision itself is now final for the
+     * currently-known track set: code elsewhere (the subtitle scan) that
+     * needs to know the *real* Tier-1 answer, not a possibly-still-false
+     * default, can now rely on it via pf_is_eligibility_decided(). */
+    p_intf->markEligibilityDecided();
+
     bool b_tier1 = false;
     std::string tier1_mime;
     if ( canRemux )

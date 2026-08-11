@@ -136,6 +136,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_input_length( VLC_TICK_INVALID )
  , m_source_can_seek( false )
  , m_source_direct( false )
+ , m_eligibility_decided( false )
  , m_source_httpd_url(NULL)
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
@@ -178,6 +179,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_source_info  = set_source_info;
     m_common.pf_is_source_direct = is_source_direct;
     m_common.pf_seek             = seek_source;
+    m_common.pf_is_eligibility_decided = is_eligibility_decided;
 
     m_subtitle_url = httpd_UrlNew( m_httpd.m_host, getHttpSubtitlePath().c_str(), NULL, NULL );
     if( m_subtitle_url != NULL )
@@ -429,6 +431,24 @@ bool intf_sys_t::isSourceDirect() const
 {
     vlc_mutex_locker lock( &m_lock );
     return m_source_direct;
+}
+
+void intf_sys_t::markEligibilityDecided()
+{
+    vlc_mutex_locker lock( &m_lock );
+    m_eligibility_decided = true;
+}
+
+bool intf_sys_t::isEligibilityDecided() const
+{
+    vlc_mutex_locker lock( &m_lock );
+    return m_eligibility_decided;
+}
+
+bool intf_sys_t::is_eligibility_decided( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    return p_sys->isEligibilityDecided();
 }
 
 std::string intf_sys_t::getSourceMime() const

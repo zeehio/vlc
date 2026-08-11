@@ -226,6 +226,8 @@ struct intf_sys_t
     bool isSourceDirect() const;
     std::string getSourceMime() const;
     bool seekSource( vlc_tick_t time );
+    void markEligibilityDecided();
+    bool isEligibilityDecided() const;
     int httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
                            const httpd_message_t *query );
     /**
@@ -290,6 +292,7 @@ private:
     static void set_source_info(void*, const char *psz_url, const char *psz_demux, bool b_can_seek);
     static bool is_source_direct(void*);
     static bool seek_source(void*, vlc_tick_t time);
+    static bool is_eligibility_decided(void*);
 
     void prepareHttpArtwork();
 
@@ -358,6 +361,7 @@ private:
     bool              m_source_can_seek;
     std::string       m_source_mime;
     bool              m_source_direct;
+    bool              m_eligibility_decided;
 
     struct SourceStreamClient;
     httpd_url_t                                    *m_source_httpd_url;
