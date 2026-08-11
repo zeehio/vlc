@@ -39,6 +39,7 @@
 #include <vlc_httpd.h>
 
 #include <cassert>
+#include <cinttypes>
 
 #define TRANSCODING_NONE 0x0
 #define TRANSCODING_VIDEO 0x1
@@ -1229,10 +1230,15 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
     if ( canRemux )
     {
         std::string source_demux = p_intf->getSourceDemux();
-        if ( ( source_demux == "mp4" || source_demux == "mkv" )
-          && p_intf->getSourceCanSeek()
-          && p_intf->getInputLength() > 0
-          && !p_intf->getSourceUrl().empty() )
+        bool b_container_ok = ( source_demux == "mp4" || source_demux == "mkv" );
+        bool b_can_seek = p_intf->getSourceCanSeek();
+        vlc_tick_t i_input_length = p_intf->getInputLength();
+        bool b_url_ok = !p_intf->getSourceUrl().empty();
+        msg_Dbg( p_stream, "tier1 check: canRemux=1 demux=\"%s\" container_ok=%d "
+                "can_seek=%d length=%" PRId64 " url_ok=%d",
+                source_demux.c_str(), b_container_ok, b_can_seek,
+                (int64_t)i_input_length, b_url_ok );
+        if ( b_container_ok && b_can_seek && i_input_length > 0 && b_url_ok )
         {
             const bool b_source_webm = ( i_codec_audio == VLC_CODEC_VORBIS ||
                                         i_codec_audio == VLC_CODEC_OPUS ) &&
@@ -1247,6 +1253,8 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
                     : ( p_original_video ? "video/x-matroska" : "audio/x-matroska" );
         }
     }
+    else
+        msg_Dbg( p_stream, "tier1 check: canRemux=0, skipping" );
 
     if ( b_tier1 )
     {

@@ -107,6 +107,9 @@ struct demux_cc
             input_thread_t *p_src_input = p_demux->p_next->p_input;
             input_item_t *p_src_item = p_src_input ? input_GetItem( p_src_input ) : NULL;
             char *psz_url = p_src_item ? input_item_GetURI( p_src_item ) : NULL;
+            msg_Dbg( p_demux, "cc source info: demux=%s can_seek=%d length=%" PRId64
+                    " url=%s", p_demux->p_next->psz_demux ? p_demux->p_next->psz_demux : "(null)",
+                    m_can_seek, (int64_t)m_length, psz_url ? psz_url : "(null)" );
             p_renderer->pf_set_source_info( p_renderer->p_opaque, psz_url,
                                             p_demux->p_next->psz_demux, m_can_seek );
             free( psz_url );
