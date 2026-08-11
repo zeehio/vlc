@@ -136,6 +136,18 @@ struct demux_cc
                 p_renderer->pf_set_input_length( p_renderer->p_opaque, m_length );
                 p_renderer->pf_set_source_info( p_renderer->p_opaque, psz_url,
                                                 psz_real_demux, m_can_seek );
+
+                /* Wherever local playback already is when casting starts
+                 * (e.g. the user was already partway through the file):
+                 * Tier-1 points the receiver at the source's own absolute
+                 * timeline, so without this the initial LOAD would always
+                 * start it over from position 0. The live-restream path
+                 * doesn't need this - the stream it feeds the receiver
+                 * already only contains data from here onwards. */
+                vlc_tick_t start_time;
+                if( demux_Control( p_demux->p_next, DEMUX_GET_TIME, &start_time ) != VLC_SUCCESS )
+                    start_time = VLC_TICK_INVALID;
+                p_renderer->pf_set_start_time( p_renderer->p_opaque, start_time );
             }
             free( psz_url );
         }

@@ -134,6 +134,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_subtitle_url(NULL)
  , m_subtitle_webvtt(NULL)
  , m_input_length( VLC_TICK_INVALID )
+ , m_start_time( VLC_TICK_INVALID )
  , m_source_can_seek( false )
  , m_source_direct( false )
  , m_eligibility_decided( false )
@@ -176,6 +177,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_subtitle     = set_subtitle;
     m_common.pf_reload           = reload;
     m_common.pf_set_input_length = set_input_length;
+    m_common.pf_set_start_time   = set_start_time;
     m_common.pf_set_source_info  = set_source_info;
     m_common.pf_is_source_direct = is_source_direct;
     m_common.pf_seek             = seek_source;
@@ -397,6 +399,24 @@ vlc_tick_t intf_sys_t::getInputLength() const
 {
     vlc_mutex_locker lock( &m_lock );
     return m_input_length;
+}
+
+void intf_sys_t::setStartTime( vlc_tick_t time )
+{
+    vlc_mutex_locker lock( &m_lock );
+    m_start_time = time;
+}
+
+vlc_tick_t intf_sys_t::getStartTime() const
+{
+    vlc_mutex_locker lock( &m_lock );
+    return m_start_time;
+}
+
+void intf_sys_t::set_start_time( void *data, vlc_tick_t time )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setStartTime( time );
 }
 
 void intf_sys_t::setSourceInfo( const char *psz_url, const char *psz_demux, bool b_can_seek )
@@ -861,9 +881,10 @@ void intf_sys_t::tryLoad()
     // Reset the mediaSessionID to allow the new session to become the current one.
     // we cannot start a new load when the last one is still processing
     std::string contentPath = m_source_direct ? getHttpSourcePath() : std::string();
+    vlc_tick_t startTime = m_source_direct ? m_start_time : VLC_TICK_INVALID;
     m_last_request_id =
         m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, subtitleUrl,
-                                        m_input_length, contentPath );
+                                        m_input_length, contentPath, startTime );
     if( m_last_request_id != ChromecastCommunication::kInvalidId )
         m_state = Loading;
 }

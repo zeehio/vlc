@@ -128,7 +128,8 @@ public:
     unsigned msgPlayerLoad( const std::string& destinationId,
                             const std::string& mime, const vlc_meta_t *p_meta,
                             const std::string& subtitleUrl, vlc_tick_t i_duration,
-                            const std::string& contentPath = std::string() );
+                            const std::string& contentPath = std::string(),
+                            vlc_tick_t i_start_time = VLC_TICK_INVALID );
     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
@@ -208,6 +209,8 @@ struct intf_sys_t
     void requestReload();
     void setInputLength( vlc_tick_t length );
     vlc_tick_t getInputLength() const;
+    void setStartTime( vlc_tick_t time );
+    vlc_tick_t getStartTime() const;
     void setSourceInfo( const char *psz_url, const char *psz_demux, bool b_can_seek );
     std::string getSourceUrl() const;
     std::string getSourceDemux() const;
@@ -289,6 +292,7 @@ private:
     static void set_subtitle(void*, char *psz_webvtt);
     static void reload(void*);
     static void set_input_length(void*, vlc_tick_t length);
+    static void set_start_time(void*, vlc_tick_t time);
     static void set_source_info(void*, const char *psz_url, const char *psz_demux, bool b_can_seek);
     static bool is_source_direct(void*);
     static bool seek_source(void*, vlc_tick_t time);
@@ -356,6 +360,7 @@ private:
     httpd_url_t      *m_subtitle_url;
     char             *m_subtitle_webvtt;
     vlc_tick_t        m_input_length;
+    vlc_tick_t        m_start_time;
     std::string       m_source_url;
     std::string       m_source_demux;
     bool              m_source_can_seek;

@@ -101,6 +101,14 @@ typedef struct
     void (*pf_set_input_length)(void *, vlc_tick_t length);
 
     /**
+     * Report the local playback position at the moment casting starts
+     * (VLC_TICK_INVALID if unknown). Tier-1 sessions use this as the
+     * initial LOAD's start position, so casting an already-partway-through
+     * file doesn't restart it from the beginning.
+     */
+    void (*pf_set_start_time)(void *, vlc_tick_t time);
+
+    /**
      * Report the original source of the media being cast, as known by the
      * local demux: its URL (so a direct-serve HTTP endpoint can open the
      * same resource) and the name of the demux module that recognized it
