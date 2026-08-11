@@ -53,6 +53,8 @@ struct demux_cc
         ,m_enabled( true )
         ,m_subtitle_scanned( false )
         ,m_subtitle_loaded_once( false )
+        ,m_subtitle_has_content( false )
+        ,m_subtitle_scan_was_tier1( false )
     {
         init();
     }
@@ -256,18 +258,30 @@ struct demux_cc
          * for the live-restream path always re-casting from "now": each
          * "segment" the receiver gets starts at zero, so subtitle cues
          * need to be shifted back by however far into the file that
-         * segment actually starts. */
+         * segment actually starts.
+         *
+         * Whether this session is Tier-1 is only known once cast.cpp has
+         * seen data flow through the sout chain at least once - which
+         * cannot happen before this, the very first Demux() call, returns.
+         * So on this first scan, pf_is_source_direct() is necessarily still
+         * false even for a session that will end up being Tier-1: the
+         * offset used here is provisional. Demux() rechecks on every
+         * subsequent call and re-scans (reloading the receiver) once the
+         * real Tier-1 status is known, in case it doesn't match. */
+        bool b_tier1 = p_renderer->pf_is_source_direct( p_renderer->p_opaque );
         vlc_tick_t offset = 0;
-        if( !uri.empty() && !p_renderer->pf_is_source_direct( p_renderer->p_opaque )
+        if( !uri.empty() && !b_tier1
          && demux_Control( p_demux->p_next, DEMUX_GET_TIME, &offset ) != VLC_SUCCESS )
             offset = 0;
 
         char *psz_webvtt = uri.empty() ? NULL
                           : chromecast_ConvertSubtitleFileToWebVTT( VLC_OBJECT(p_demux),
                                                                     uri.c_str(), offset );
-        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms)",
-                psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ) );
+        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms, tier1=%d)",
+                psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ), b_tier1 );
         p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );
+        m_subtitle_has_content = psz_webvtt != NULL;
+        m_subtitle_scan_was_tier1 = b_tier1;
 
         if( psz_webvtt != NULL )
         {
@@ -406,6 +420,16 @@ struct demux_cc
         if( !m_subtitle_scanned )
         {
             m_subtitle_scanned = true;
+            setSubtitleFromSlaves();
+        }
+        else if( m_subtitle_has_content
+              && m_subtitle_scan_was_tier1 != p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
+        {
+            /* The Tier-1 status used for the last scan's offset no longer
+             * matches reality (either it settled after that first,
+             * necessarily provisional scan, or it changed since - e.g. a
+             * track change flipped eligibility): regenerate the sidecar
+             * with the correct reference frame and reload the receiver. */
             setSubtitleFromSlaves();
         }
 
@@ -648,6 +672,8 @@ protected:
     bool          m_enabled;
     bool          m_subtitle_scanned;
     bool          m_subtitle_loaded_once;
+    bool          m_subtitle_has_content;
+    bool          m_subtitle_scan_was_tier1;
     bool          m_demux_eof;
     double        m_start_pos;
     double        m_last_pos;
