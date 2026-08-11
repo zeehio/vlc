@@ -126,7 +126,7 @@ public:
     unsigned msgAuth();
     unsigned msgPlayerLoad( const std::string& destinationId,
                             const std::string& mime, const vlc_meta_t *p_meta,
-                            const std::string& subtitleUrl );
+                            const std::string& subtitleUrl, vlc_tick_t i_duration );
     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
@@ -150,7 +150,7 @@ private:
                      castchannel::CastMessage_PayloadType payloadType = castchannel::CastMessage_PayloadType_STRING);
     int pushMediaPlayerMessage( const std::string& destinationId, const std::stringstream & payload );
     std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta,
-                          const std::string& subtitleUrl );
+                          const std::string& subtitleUrl, vlc_tick_t i_duration );
     unsigned getNextReceiverRequestId();
     unsigned getNextRequestId();
 
@@ -202,6 +202,7 @@ struct intf_sys_t
     int httpd_file_fill( uint8_t *psz_request, uint8_t **pp_data, int *pi_data );
     void setSubtitle( char *psz_webvtt );
     void requestReload();
+    void setInputLength( vlc_tick_t length );
     int httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
                            const httpd_message_t *query );
     void interrupt_wake_up();
@@ -252,6 +253,7 @@ private:
     static void set_meta(void*, vlc_meta_t *p_meta);
     static void set_subtitle(void*, char *psz_webvtt);
     static void reload(void*);
+    static void set_input_length(void*, vlc_tick_t length);
 
     void prepareHttpArtwork();
 
@@ -314,6 +316,7 @@ private:
 
     httpd_url_t      *m_subtitle_url;
     char             *m_subtitle_webvtt;
+    vlc_tick_t        m_input_length;
 
     vlc_tick_t        m_cc_time_last_request_date;
     vlc_tick_t        m_cc_time_date;

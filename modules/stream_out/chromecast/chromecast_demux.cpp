@@ -98,6 +98,7 @@ struct demux_cc
             m_can_seek = false;
         if (demux_Control( p_demux->p_next, DEMUX_GET_LENGTH, &m_length ) != VLC_SUCCESS)
             m_length = -1;
+        p_renderer->pf_set_input_length( p_renderer->p_opaque, m_length );
 
         /* input_item_t's slave list is not populated yet at this point:
          * Init() creates the master demux (and this filter along with it)

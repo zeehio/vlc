@@ -119,6 +119,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_art_idx(0)
  , m_subtitle_url(NULL)
  , m_subtitle_webvtt(NULL)
+ , m_input_length( VLC_TICK_INVALID )
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
  , m_pingRetriesLeft( PING_WAIT_RETRIES )
@@ -156,6 +157,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_meta         = set_meta;
     m_common.pf_set_subtitle     = set_subtitle;
     m_common.pf_reload           = reload;
+    m_common.pf_set_input_length = set_input_length;
 
     m_subtitle_url = httpd_UrlNew( m_httpd.m_host, getHttpSubtitlePath().c_str(), NULL, NULL );
     if( m_subtitle_url != NULL )
@@ -340,6 +342,18 @@ void intf_sys_t::set_subtitle( void *data, char *psz_webvtt )
     p_sys->setSubtitle( psz_webvtt );
 }
 
+void intf_sys_t::setInputLength( vlc_tick_t length )
+{
+    vlc_mutex_locker lock( &m_lock );
+    m_input_length = length;
+}
+
+void intf_sys_t::set_input_length( void *data, vlc_tick_t length )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setInputLength( length );
+}
+
 /**
  * Re-sends a LOAD message for the media that is already playing, so the
  * receiver re-fetches its sidecar text track (see pf_reload's doc in
@@ -518,7 +532,8 @@ void intf_sys_t::tryLoad()
     // Reset the mediaSessionID to allow the new session to become the current one.
     // we cannot start a new load when the last one is still processing
     m_last_request_id =
-        m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, subtitleUrl );
+        m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, subtitleUrl,
+                                        m_input_length );
     if( m_last_request_id != ChromecastCommunication::kInvalidId )
         m_state = Loading;
 }

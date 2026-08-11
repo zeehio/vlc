@@ -91,6 +91,15 @@ typedef struct
      */
     void (*pf_reload)(void *);
 
+    /**
+     * Report the total duration of the media being cast, as known by the
+     * local demux (VLC_TICK_INVALID/<= 0 if unknown, e.g. a live capture
+     * source such as a webcam). A known duration lets the LOAD message
+     * declare the media as seekable (streamType "BUFFERED" with a real
+     * duration) instead of "LIVE".
+     */
+    void (*pf_set_input_length)(void *, vlc_tick_t length);
+
 } chromecast_common;
 
 # ifdef __cplusplus

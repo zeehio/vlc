@@ -285,7 +285,8 @@ static std::string meta_get_escaped(const vlc_meta_t *p_meta, vlc_meta_type_t ty
 
 std::string ChromecastCommunication::GetMedia( const std::string& mime,
                                                const vlc_meta_t *p_meta,
-                                               const std::string& subtitleUrl )
+                                               const std::string& subtitleUrl,
+                                               vlc_tick_t i_duration )
 {
     std::stringstream ss;
 
@@ -351,8 +352,23 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
     msg_Dbg( m_module, "s_chromecast_url: %s", chromecast_url.str().c_str());
 
     ss << "\"contentId\":\"" << chromecast_url.str() << "\""
-       << ",\"streamType\":\"LIVE\""
        << ",\"contentType\":\"" << mime << "\"";
+
+    /* A known duration (i.e. anything but a live capture source such as a
+     * webcam) is declared as "BUFFERED" with that duration, rather than
+     * "LIVE": this is what makes the receiver offer a seek bar and honor
+     * remote/touch seek gestures at all. There is no seekable index behind
+     * this contentId yet - this is step one of enabling receiver-driven
+     * seeking, evaluating whether/how the receiver reacts before building
+     * that index. */
+    if( i_duration > 0 )
+    {
+        double f_duration_sec = (double)i_duration / (double)CLOCK_FREQ;
+        ss << ",\"streamType\":\"BUFFERED\""
+           << ",\"duration\":" << f_duration_sec;
+    }
+    else
+        ss << ",\"streamType\":\"LIVE\"";
 
     if( !subtitleUrl.empty() )
     {
@@ -374,12 +390,12 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
 
 unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
                                              const std::string& mime, const vlc_meta_t *p_meta,
-                                             const std::string& subtitleUrl )
+                                             const std::string& subtitleUrl, vlc_tick_t i_duration )
 {
     unsigned id = getNextRequestId();
     std::stringstream ss;
     ss << "{\"type\":\"LOAD\","
-       <<  "\"media\":{" << GetMedia( mime, p_meta, subtitleUrl ) << "},";
+       <<  "\"media\":{" << GetMedia( mime, p_meta, subtitleUrl, i_duration ) << "},";
     if( !subtitleUrl.empty() )
         ss << "\"activeTrackIds\":[" << CC_SUBTITLE_TRACK_ID << "],";
     ss <<  "\"autoplay\":\"false\","
