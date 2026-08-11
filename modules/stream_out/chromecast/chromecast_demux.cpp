@@ -145,8 +145,11 @@ struct demux_cc
                  * doesn't need this - the stream it feeds the receiver
                  * already only contains data from here onwards. */
                 vlc_tick_t start_time;
-                if( demux_Control( p_demux->p_next, DEMUX_GET_TIME, &start_time ) != VLC_SUCCESS )
+                int i_start_ret = demux_Control( p_demux->p_next, DEMUX_GET_TIME, &start_time );
+                if( i_start_ret != VLC_SUCCESS )
                     start_time = VLC_TICK_INVALID;
+                msg_Dbg( p_demux, "cc start time: DEMUX_GET_TIME ret=%d value=%" PRId64 "ms",
+                        i_start_ret, MS_FROM_VLC_TICK( start_time ) );
                 p_renderer->pf_set_start_time( p_renderer->p_opaque, start_time );
             }
             free( psz_url );

@@ -882,6 +882,8 @@ void intf_sys_t::tryLoad()
     // we cannot start a new load when the last one is still processing
     std::string contentPath = m_source_direct ? getHttpSourcePath() : std::string();
     vlc_tick_t startTime = m_source_direct ? m_start_time : VLC_TICK_INVALID;
+    msg_Dbg( m_module, "tryLoad: source_direct=%d m_start_time=%" PRId64 "ms startTime=%" PRId64 "ms",
+            m_source_direct, MS_FROM_VLC_TICK( m_start_time ), MS_FROM_VLC_TICK( startTime ) );
     m_last_request_id =
         m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, subtitleUrl,
                                         m_input_length, contentPath, startTime );
