@@ -143,13 +143,38 @@ struct demux_cc
                  * timeline, so without this the initial LOAD would always
                  * start it over from position 0. The live-restream path
                  * doesn't need this - the stream it feeds the receiver
-                 * already only contains data from here onwards. */
-                vlc_tick_t start_time;
-                int i_start_ret = demux_Control( p_demux->p_next, DEMUX_GET_TIME, &start_time );
-                if( i_start_ret != VLC_SUCCESS )
-                    start_time = VLC_TICK_INVALID;
-                msg_Dbg( p_demux, "cc start time: DEMUX_GET_TIME ret=%d value=%" PRId64 "ms",
-                        i_start_ret, MS_FROM_VLC_TICK( start_time ) );
+                 * already only contains data from here onwards.
+                 *
+                 * A fresh input opened with a "start-time" option (e.g. the
+                 * app reopening the player with a resume position when
+                 * attaching a renderer) only queues the seek to that
+                 * position - StartTitle() in input.c pushes an
+                 * INPUT_CONTROL_SET_TIME control, processed asynchronously
+                 * by the input thread's control loop, same as this demux
+                 * filter's own insertion. There is no ordering guarantee
+                 * between the two, and DEMUX_GET_TIME here can legitimately
+                 * still read the pre-seek position (0) if this runs first.
+                 * Reading the "start-time" input var directly sidesteps
+                 * that race entirely: it reflects the requested position
+                 * from the moment the input exists, regardless of whether
+                 * the seek it schedules has actually run yet. Only a fresh
+                 * input honours this option at all, so an already-running,
+                 * live-attached one (where it's unset/0, and the demux
+                 * genuinely has progressed) correctly falls back to
+                 * DEMUX_GET_TIME below. */
+                vlc_tick_t start_time = VLC_TICK_INVALID;
+                float f_start_time_opt = p_src_input
+                                        ? var_GetFloat( p_src_input, "start-time" ) : 0.f;
+                if( f_start_time_opt > 0.f )
+                    start_time = vlc_tick_t( f_start_time_opt * CLOCK_FREQ );
+                else
+                {
+                    int i_start_ret = demux_Control( p_demux->p_next, DEMUX_GET_TIME, &start_time );
+                    if( i_start_ret != VLC_SUCCESS )
+                        start_time = VLC_TICK_INVALID;
+                }
+                msg_Dbg( p_demux, "cc start time: start-time opt=%f value=%" PRId64 "ms",
+                        f_start_time_opt, MS_FROM_VLC_TICK( start_time ) );
                 p_renderer->pf_set_start_time( p_renderer->p_opaque, start_time );
             }
             free( psz_url );
