@@ -398,8 +398,16 @@ unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationI
     std::stringstream ss;
     ss << "{\"type\":\"LOAD\","
        <<  "\"media\":{" << GetMedia( mime, p_meta, subtitleUrl, i_duration, contentPath ) << "},";
+    /* Always explicit, never omitted: the receiver's connection (and
+     * whatever it's currently rendering) persists across LOADs for
+     * successive videos in the same cast session, so a LOAD for a video
+     * with no subtitle of its own must actively clear the previous video's
+     * active track, not just leave the field unset - otherwise its cues
+     * keep being rendered over the new video. */
+    ss << "\"activeTrackIds\":[";
     if( !subtitleUrl.empty() )
-        ss << "\"activeTrackIds\":[" << CC_SUBTITLE_TRACK_ID << "],";
+        ss << CC_SUBTITLE_TRACK_ID;
+    ss << "],";
     ss <<  "\"autoplay\":\"false\","
        <<  "\"requestId\":" << id
        << "}";
