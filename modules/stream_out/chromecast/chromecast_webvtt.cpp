@@ -1,5 +1,6 @@
 /*****************************************************************************
- * chromecast_webvtt.cpp: SRT/WebVTT helpers for the Chromecast sidecar track
+ * chromecast_webvtt.cpp: convert a subtitle file to WebVTT for the
+ * Chromecast sidecar track, reusing VLC's own subtitle demux/decode chain
  *****************************************************************************
  * Copyright © 2015-2016 VideoLAN
  *
@@ -24,48 +25,185 @@
 
 #include "chromecast_webvtt.h"
 
+#include <vlc_stream.h>
+#include <vlc_demux.h>
+#include <vlc_codec.h>
+#include <vlc_es_out.h>
+#include <vlc_modules.h>
+#include <vlc_text_style.h>
+
 #include <cstdio>
-#include <cstring>
-#include <vector>
+#include <string>
 
-bool chromecast_HasExtension( const char *psz_uri, const char *psz_ext )
+namespace {
+
+/* ---- decoder: owns a decoder_t and collects every subpicture it queues,
+ * decoding synchronously (this is a one-shot batch conversion of a whole
+ * file, not a live pipeline: no threads, no pacing). Mirrors the pattern
+ * modules/stream_out/transcode/spu.c uses for the same "spu decoder"
+ * capability, minus everything specific to a live sout_stream. Unlike the
+ * 4.0 branch this is ported from, decoder_t here is a plain vlc_object_t
+ * (VLC_COMMON_MEMBERS) with fmt_in/callbacks as direct members - no
+ * separate "owner" wrapper struct is needed. ---- */
+struct SubtitleDecoder
 {
-    size_t i_uri = strlen( psz_uri );
-    size_t i_ext = strlen( psz_ext );
-    if( i_uri < i_ext + 1 || psz_uri[i_uri - i_ext - 1] != '.' )
-        return false;
-    for( size_t i = 0; i < i_ext; ++i )
+    decoder_t     dec;
+    subpicture_t *spu_first;
+    subpicture_t **spu_last;
+
+    static subpicture_t *BufferNew( decoder_t *, const subpicture_updater_t *upd )
     {
-        char a = psz_uri[i_uri - i_ext + i];
-        char b = psz_ext[i];
-        if( a >= 'A' && a <= 'Z' ) a += 'a' - 'A';
-        if( b >= 'A' && b <= 'Z' ) b += 'a' - 'A';
-        if( a != b )
-            return false;
+        return subpicture_New( upd );
     }
-    return true;
+
+    static int QueueSub( decoder_t *dec, subpicture_t *spu )
+    {
+        SubtitleDecoder *sys = static_cast<SubtitleDecoder *>( dec->p_queue_ctx );
+        *sys->spu_last = spu;
+        sys->spu_last = &spu->p_next;
+        spu->p_next = nullptr;
+        return VLC_SUCCESS;
+    }
+};
+
+void DeleteSubtitleDecoder( SubtitleDecoder *sys )
+{
+    if( sys == nullptr )
+        return;
+    for( subpicture_t *sp = sys->spu_first; sp != nullptr; )
+    {
+        subpicture_t *next = sp->p_next;
+        subpicture_Delete( sp );
+        sp = next;
+    }
+    if( sys->dec.p_module != nullptr )
+        module_unneed( &sys->dec, sys->dec.p_module );
+    es_format_Clean( &sys->dec.fmt_in );
+    es_format_Clean( &sys->dec.fmt_out );
+    vlc_object_release( &sys->dec );
 }
 
-bool chromecast_ParseVttTimestamp( const std::string &s, int64_t *out_ms )
+/* ---- minimal es_out_t: hands every SPU_ES block to the decoder above as
+ * soon as the demuxer sends it (no fifo/threading needed: pf_decode is a
+ * synchronous call for spu decoders). Only the first SPU track found is
+ * used - a sidecar track needs one text stream, and subtitle files don't
+ * carry more than one anyway. ---- */
+struct SubtitleEsOut
 {
-    unsigned h, m, sec, ms;
-    if( sscanf( s.c_str(), "%u:%u:%u%*[,.]%u", &h, &m, &sec, &ms ) == 4 )
+    es_out_t out;
+    vlc_object_t *p_parent;
+    SubtitleDecoder *decoder;
+
+    static es_out_id_t *Add( es_out_t *out, const es_format_t *fmt )
     {
-        *out_ms = ( (int64_t)h * 3600 + m * 60 + sec ) * 1000 + ms;
-        return true;
+        SubtitleEsOut *sys = container_of( out, SubtitleEsOut, out );
+        if( fmt->i_cat != SPU_ES || sys->decoder != nullptr )
+            return nullptr;
+
+        SubtitleDecoder *dec = static_cast<SubtitleDecoder *>(
+            vlc_object_create( sys->p_parent, sizeof( SubtitleDecoder ) ) );
+        if( unlikely( dec == nullptr ) )
+            return nullptr;
+        dec->spu_first = nullptr;
+        dec->spu_last = &dec->spu_first;
+
+        if( es_format_Copy( &dec->dec.fmt_in, fmt ) != VLC_SUCCESS )
+        {
+            vlc_object_release( &dec->dec );
+            return nullptr;
+        }
+        es_format_Init( &dec->dec.fmt_out, SPU_ES, 0 );
+        dec->dec.p_module = nullptr;
+        dec->dec.p_sys = nullptr;
+        dec->dec.b_frame_drop_allowed = false;
+        dec->dec.pf_decode = nullptr;
+        dec->dec.pf_spu_buffer_new = SubtitleDecoder::BufferNew;
+        dec->dec.pf_queue_sub = SubtitleDecoder::QueueSub;
+        dec->dec.p_queue_ctx = dec;
+
+        dec->dec.p_module = module_need( &dec->dec, "spu decoder", nullptr, false );
+        if( dec->dec.p_module == nullptr )
+        {
+            msg_Warn( sys->p_parent, "cc subtitle convert: no spu decoder found" );
+            es_format_Clean( &dec->dec.fmt_in );
+            es_format_Clean( &dec->dec.fmt_out );
+            vlc_object_release( &dec->dec );
+            return nullptr;
+        }
+
+        sys->decoder = dec;
+        return reinterpret_cast<es_out_id_t *>( dec );
     }
-    if( sscanf( s.c_str(), "%u:%u%*[,.]%u", &m, &sec, &ms ) == 3 )
+
+    static int Send( es_out_t *out, es_out_id_t *id, block_t *block )
     {
-        *out_ms = ( (int64_t)m * 60 + sec ) * 1000 + ms;
-        return true;
+        SubtitleEsOut *sys = container_of( out, SubtitleEsOut, out );
+        if( reinterpret_cast<SubtitleDecoder *>( id ) != sys->decoder
+         || sys->decoder->dec.pf_decode == nullptr )
+        {
+            block_Release( block );
+            return VLC_SUCCESS;
+        }
+        sys->decoder->dec.pf_decode( &sys->decoder->dec, block );
+        return VLC_SUCCESS;
     }
-    return false;
+
+    static void Del( es_out_t *, es_out_id_t * ) {}
+    static int Control( es_out_t *, int, va_list ) { return VLC_EGENERIC; }
+};
+
+/* ---- WebVTT text serialization: this VLC checkout has no "spu encoder"
+ * or "sout mux" module for WebVTT (those are 4.0-only), so cues are
+ * formatted directly from the decoded subpicture text regions instead of
+ * going through that plugin machinery - there is no ISOBMFF box framing
+ * to worry about either way, this only ever needs to produce a plain
+ * text/vtt document. Escaping mirrors modules/codec/webvtt/encvtt.c on
+ * the 4.0 branch this is ported from. ---- */
+void AppendEscaped( std::string &out, const char *psz )
+{
+    for( ; *psz; ++psz )
+    {
+        switch( *psz )
+        {
+            case '&': out += "&#x26;"; break;
+            case '<': out += "&#x3c;"; break;
+            case '>': out += "&#x3e;"; break; /* escapes forbidden --> sequence */
+            default:  out += *psz;
+        }
+    }
 }
 
-std::string chromecast_FormatVttTimestamp( int64_t ms )
+void AppendCueText( std::string &out, const subpicture_region_t *region )
 {
-    if( ms < 0 )
-        ms = 0;
+    for( const text_segment_t *seg = region->p_text; seg != nullptr; seg = seg->p_next )
+    {
+        if( seg->psz_text == nullptr )
+            continue;
+
+        const text_style_t *style = seg->style;
+        bool bold = false, italic = false, underline = false;
+        if( style != nullptr && ( style->i_features & STYLE_HAS_FLAGS ) )
+        {
+            bold = style->i_style_flags & STYLE_BOLD;
+            italic = style->i_style_flags & STYLE_ITALIC;
+            underline = style->i_style_flags & STYLE_UNDERLINE;
+        }
+
+        if( bold ) out += "<b>";
+        if( underline ) out += "<u>";
+        if( italic ) out += "<i>";
+        AppendEscaped( out, seg->psz_text );
+        if( italic ) out += "</i>";
+        if( underline ) out += "</u>";
+        if( bold ) out += "</b>";
+    }
+}
+
+std::string FormatVttTimestamp( vlc_tick_t t )
+{
+    if( t < 0 )
+        t = 0;
+    int64_t ms = MS_FROM_VLC_TICK( t );
     unsigned msec = (unsigned)( ms % 1000 ); ms /= 1000;
     unsigned sec  = (unsigned)( ms % 60 );   ms /= 60;
     unsigned min  = (unsigned)( ms % 60 );   ms /= 60;
@@ -75,124 +213,106 @@ std::string chromecast_FormatVttTimestamp( int64_t ms )
     return std::string( buf );
 }
 
-std::string chromecast_ConvertSubtitleToWebVTT( const std::string &content, bool is_srt,
-                                                 int64_t i_offset_ms )
+} // namespace
+
+char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
+                                              const char *psz_uri,
+                                              vlc_tick_t i_offset )
 {
+    stream_t *s = vlc_stream_NewURL( p_parent, psz_uri );
+    if( s == nullptr )
+    {
+        msg_Warn( p_parent, "cc subtitle convert: vlc_stream_NewURL failed for %s", psz_uri );
+        return nullptr;
+    }
+
+    /* demux/subtitle.c inherits this var from input_thread_t normally; we
+     * are not running under one, so create it ourselves defensively. */
+    var_Create( p_parent, "sub-original-fps", VLC_VAR_FLOAT );
+
+    SubtitleEsOut es_out;
+    es_out.out.pf_add = SubtitleEsOut::Add;
+    es_out.out.pf_send = SubtitleEsOut::Send;
+    es_out.out.pf_del = SubtitleEsOut::Del;
+    es_out.out.pf_control = SubtitleEsOut::Control;
+    es_out.p_parent = p_parent;
+    es_out.decoder = nullptr;
+
+    demux_t *demux = demux_New( p_parent, "subtitle", psz_uri, s, &es_out.out );
+    if( demux == nullptr )
+    {
+        msg_Dbg( p_parent, "cc subtitle convert: %s is not a subtitle file VLC recognizes",
+                psz_uri );
+        vlc_stream_Delete( s );
+        return nullptr;
+    }
+
+    int ret;
+    do
+        ret = demux_Demux( demux );
+    while( ret == VLC_DEMUXER_SUCCESS );
+
+    demux_Delete( demux ); /* also deletes s */
+
+    if( es_out.decoder == nullptr )
+    {
+        msg_Dbg( p_parent, "cc subtitle convert: no subtitle track found in %s", psz_uri );
+        return nullptr;
+    }
+
+    /* spu decoders (subsdec, libass, ...) don't lay out regions at decode
+     * time: that's deferred to a subpicture_updater_t, normally invoked by
+     * the video compositor against the real canvas size. We have none, so
+     * use a placeholder: WebVTT cue positioning here is percentage/line
+     * based, not pixel-exact. */
+    video_format_t canvas;
+    video_format_Init( &canvas, 0 );
+    canvas.i_width = canvas.i_visible_width = 1280;
+    canvas.i_height = canvas.i_visible_height = 720;
+    canvas.i_sar_num = canvas.i_sar_den = 1;
+
     std::string out( "WEBVTT\n\n" );
+    unsigned n_cues = 0;
 
-    size_t start = 0;
-    /* Strip a leading UTF-8 BOM if present */
-    if( content.compare( 0, 3, "\xEF\xBB\xBF" ) == 0 )
-        start = 3;
-
-    std::vector<std::string> lines;
+    for( subpicture_t *sp = es_out.decoder->spu_first; sp != nullptr; sp = sp->p_next )
     {
-        size_t pos = start;
-        while( pos <= content.size() )
+        subpicture_Update( sp, &canvas, &canvas, sp->i_start );
+
+        /* Shift into the current Cast segment's own timeline (see the
+         * header doc), dropping cues that end up entirely before it. */
+        vlc_tick_t start = sp->i_start - i_offset + VLC_TICK_0;
+        vlc_tick_t stop = sp->i_stop != VLC_TICK_INVALID
+                         ? sp->i_stop - i_offset + VLC_TICK_0 : VLC_TICK_INVALID;
+        if( stop != VLC_TICK_INVALID && stop <= VLC_TICK_0 )
+            continue;
+
+        for( const subpicture_region_t *r = sp->p_region; r != nullptr; r = r->p_next )
         {
-            size_t eol = content.find( '\n', pos );
-            std::string line = content.substr( pos, eol == std::string::npos ? std::string::npos : eol - pos );
-            if( !line.empty() && line.back() == '\r' )
-                line.pop_back();
-            lines.push_back( line );
-            if( eol == std::string::npos )
-                break;
-            pos = eol + 1;
-        }
-    }
+            if( r->p_text == nullptr )
+                continue;
 
-    size_t i = 0;
-    /* Skip a leading WEBVTT signature line, and any header metadata up to
-     * the first blank line, if present. */
-    if( !is_srt && i < lines.size() && lines[i].compare( 0, 6, "WEBVTT" ) == 0 )
-    {
-        while( i < lines.size() && !lines[i].empty() )
-            ++i;
-    }
+            std::string cue_text;
+            AppendCueText( cue_text, r );
+            if( cue_text.empty() )
+                continue;
 
-    while( i < lines.size() )
-    {
-        while( i < lines.size() && lines[i].empty() )
-            ++i;
-        if( i >= lines.size() )
-            break;
-
-        size_t block_start = i;
-        /* An optional numeric/identifier line precedes the timing line */
-        size_t timing_line = i;
-        if( lines[timing_line].find( "-->" ) == std::string::npos
-         && timing_line + 1 < lines.size() )
-            timing_line = i + 1;
-
-        bool have_timing = false;
-        int64_t cue_start_ms = 0, cue_end_ms = 0;
-        size_t arrow = std::string::npos;
-        if( timing_line < lines.size() )
-        {
-            arrow = lines[timing_line].find( "-->" );
-            if( arrow != std::string::npos )
-            {
-                std::string ts_start = lines[timing_line].substr( 0, arrow );
-                std::string ts_end_raw = lines[timing_line].substr( arrow + 3 );
-                /* Only the first token after "-->" is the timestamp; any
-                 * trailing cue settings (line:, position:, ...) are not
-                 * preserved. */
-                size_t e0 = ts_end_raw.find_first_not_of( " \t" );
-                std::string ts_end = e0 == std::string::npos ? std::string()
-                                    : ts_end_raw.substr( e0 );
-                size_t e1 = ts_end.find_first_of( " \t" );
-                if( e1 != std::string::npos )
-                    ts_end = ts_end.substr( 0, e1 );
-
-                have_timing = chromecast_ParseVttTimestamp( ts_start, &cue_start_ms )
-                           && chromecast_ParseVttTimestamp( ts_end, &cue_end_ms );
-            }
-        }
-
-        size_t block_end = ( arrow != std::string::npos ) ? timing_line + 1 : block_start;
-        while( block_end < lines.size() && !lines[block_end].empty() )
-            ++block_end;
-
-        if( have_timing )
-        {
-            cue_start_ms -= i_offset_ms;
-            cue_end_ms -= i_offset_ms;
-
-            /* Drop cues that belong entirely to a part of the file that
-             * isn't part of the current segment. */
-            if( cue_end_ms > 0 )
-            {
-                for( size_t j = block_start; j < timing_line; ++j )
-                {
-                    out += lines[j];
-                    out += '\n';
-                }
-                out += chromecast_FormatVttTimestamp( cue_start_ms );
-                out += " --> ";
-                out += chromecast_FormatVttTimestamp( cue_end_ms );
-                out += '\n';
-                for( size_t j = timing_line + 1; j < block_end; ++j )
-                {
-                    out += lines[j];
-                    out += '\n';
-                }
-                out += '\n';
-            }
-        }
-        else
-        {
-            /* Not a cue we understand (e.g. a WebVTT NOTE block): pass it
-             * through unshifted rather than losing it silently. */
-            for( size_t j = block_start; j < block_end; ++j )
-            {
-                out += lines[j];
-                out += '\n';
-            }
+            out += FormatVttTimestamp( start );
+            out += " --> ";
+            out += FormatVttTimestamp( stop != VLC_TICK_INVALID ? stop : start + VLC_TICK_FROM_SEC(4) );
             out += '\n';
+            out += cue_text;
+            out += "\n\n";
+            n_cues++;
         }
-
-        i = block_end;
     }
 
-    return out;
+    msg_Dbg( p_parent, "cc subtitle convert: %s -> %u WebVTT cue(s) for this segment",
+            psz_uri, n_cues );
+
+    DeleteSubtitleDecoder( es_out.decoder );
+
+    if( n_cues == 0 )
+        return nullptr;
+
+    return strdup( out.c_str() );
 }

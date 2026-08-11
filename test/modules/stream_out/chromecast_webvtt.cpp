@@ -1,5 +1,5 @@
 /*****************************************************************************
- * chromecast_webvtt.cpp: Chromecast sidecar WebVTT helpers unit testing
+ * chromecast_webvtt.cpp: Chromecast sidecar WebVTT conversion unit testing
  *****************************************************************************
  * Copyright © 2026 VideoLAN
  *
@@ -17,161 +17,196 @@
  * along with this program; if not, write to the Free Software Foundation,
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #undef NDEBUG
 
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+#include <vlc_common.h>
 
 #include "../../../modules/stream_out/chromecast/chromecast_webvtt.h"
+#include "../../libvlc/test.h"
+#include "../../../lib/libvlc_internal.h"
 
-static void test_HasExtension()
+/* chromecast_webvtt.cpp's msg_Dbg/msg_Warn calls need a vlc_module_name
+ * symbol, normally provided by vlc_module_begin() in the real plugin
+ * (chromecast_demux.cpp); linking LIBVLC here already pulls one in
+ * (lib/core.c's own), so unlike some other headless-libvlc tests, this one
+ * must NOT define its own or the two collide at link time. */
+
+/* Writes content to a fresh temp file and returns a file:// URI to it
+ * (heap-allocated, caller frees). chromecast_ConvertSubtitleFileToWebVTT
+ * takes a URI, not a stream, since in production it always opens a real
+ * external slave file - so the test goes through the same real file I/O
+ * path rather than mocking it away. */
+static char *WriteFixture( const char *content )
 {
-    assert( chromecast_HasExtension( "movie.srt", "srt" ) );
-    assert( chromecast_HasExtension( "movie.SRT", "srt" ) );
-    assert( chromecast_HasExtension( "movie.Srt", "srt" ) );
-    assert( chromecast_HasExtension( "/path/to/movie.webvtt", "webvtt" ) );
+    char path[] = "/tmp/cc_webvtt_test_XXXXXX";
+    int fd = mkstemp( path );
+    assert( fd >= 0 );
+    size_t len = strlen( content );
+    ssize_t written = write( fd, content, len );
+    assert( written == (ssize_t) len );
+    close( fd );
 
-    assert( !chromecast_HasExtension( "movie.ass", "srt" ) );
-    assert( !chromecast_HasExtension( "movie.srtx", "srt" ) );
-    assert( !chromecast_HasExtension( "srt", "srt" ) ); // no '.' before ext
-    assert( !chromecast_HasExtension( "", "srt" ) );
+    char *uri;
+    int r = asprintf( &uri, "file://%s", path );
+    assert( r >= 0 );
+    return uri;
 }
 
-static void test_ParseVttTimestamp()
+static void RemoveFixture( const char *uri )
 {
-    int64_t ms;
-
-    assert( chromecast_ParseVttTimestamp( "00:00:00,000", &ms ) && ms == 0 );
-    assert( chromecast_ParseVttTimestamp( "00:00:00.000", &ms ) && ms == 0 );
-    assert( chromecast_ParseVttTimestamp( "01:02:03,456", &ms )
-         && ms == ( (int64_t)1 * 3600 + 2 * 60 + 3 ) * 1000 + 456 );
-    assert( chromecast_ParseVttTimestamp( "01:02:03.456", &ms )
-         && ms == ( (int64_t)1 * 3600 + 2 * 60 + 3 ) * 1000 + 456 );
-    /* WebVTT allows omitting the hours component */
-    assert( chromecast_ParseVttTimestamp( "02:03.456", &ms )
-         && ms == ( (int64_t)2 * 60 + 3 ) * 1000 + 456 );
-
-    assert( !chromecast_ParseVttTimestamp( "not a timestamp", &ms ) );
-    assert( !chromecast_ParseVttTimestamp( "", &ms ) );
-    assert( !chromecast_ParseVttTimestamp( "00:00", &ms ) );
+    assert( strncmp( uri, "file://", 7 ) == 0 );
+    unlink( uri + 7 );
 }
 
-static void test_FormatVttTimestamp()
-{
-    assert( chromecast_FormatVttTimestamp( 0 ) == "00:00:00.000" );
-    assert( chromecast_FormatVttTimestamp( 456 ) == "00:00:00.456" );
-    assert( chromecast_FormatVttTimestamp( ( (int64_t)1 * 3600 + 2 * 60 + 3 ) * 1000 + 456 )
-            == "01:02:03.456" );
-    /* Negative values (a cue starting before the current segment) clamp to 0 */
-    assert( chromecast_FormatVttTimestamp( -1000 ) == "00:00:00.000" );
+#define SRT_FIXTURE \
+    "1\n" \
+    "00:00:01,000 --> 00:00:04,000\n" \
+    "Hello world\n" \
+    "\n" \
+    "2\n" \
+    "00:00:05,500 --> 00:00:07,000\n" \
+    "Second line\n" \
+    "with two rows\n"
 
-    /* Round-trips through ParseVttTimestamp */
-    int64_t ms;
-    assert( chromecast_ParseVttTimestamp( chromecast_FormatVttTimestamp( 3723456 ), &ms ) );
-    assert( ms == 3723456 );
+#define MICRODVD_FIXTURE \
+    "{25}{100}Frame-based cue one\n" \
+    "{150}{200}Frame-based cue two\n"
+
+/* SSA/ASS is only ever decoded through libass (a bitmap renderer, this
+ * checkout has no text-mode ASS decoder), so it can never yield WebVTT
+ * cues through this pipeline - a real, permanent limitation (see
+ * chromecast_webvtt.h), not something a future fix removes. */
+#define ASS_FIXTURE \
+    "[Script Info]\n" \
+    "Title: Test\n" \
+    "ScriptType: v4.00+\n" \
+    "PlayResX: 1280\n" \
+    "PlayResY: 720\n" \
+    "\n" \
+    "[V4+ Styles]\n" \
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n" \
+    "Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n" \
+    "\n" \
+    "[Events]\n" \
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" \
+    "Dialogue: 0,0:00:02.00,0:00:04.50,Default,,0,0,0,,Plain ASS cue\n"
+
+static void test_BasicSrt( vlc_object_t *obj )
+{
+    char *uri = WriteFixture( SRT_FIXTURE );
+
+    char *webvtt = chromecast_ConvertSubtitleFileToWebVTT( obj, uri, 0 );
+    assert( webvtt != NULL );
+    std::string out( webvtt );
+    free( webvtt );
+
+    assert( out.compare( 0, 8, "WEBVTT\n\n" ) == 0 );
+    assert( out.find( "00:00:01.000 --> 00:00:04.000" ) != std::string::npos );
+    assert( out.find( "Hello world" ) != std::string::npos );
+    assert( out.find( "00:00:05.500 --> 00:00:07.000" ) != std::string::npos );
+    assert( out.find( "Second line" ) != std::string::npos );
+    assert( out.find( "with two rows" ) != std::string::npos );
+
+    RemoveFixture( uri );
+    free( uri );
 }
 
-static void test_ConvertSubtitleToWebVTT_BasicSrt()
+static void test_SegmentOffsetDropsAndShiftsCues( vlc_object_t *obj )
 {
-    const std::string srt =
-        "1\n"
-        "00:00:01,000 --> 00:00:04,000\n"
-        "Hello world\n"
-        "\n"
-        "2\n"
-        "00:00:05,500 --> 00:00:07,000\n"
-        "Second line\n";
+    char *uri = WriteFixture( SRT_FIXTURE );
 
-    const std::string expected =
-        "WEBVTT\n\n"
-        "1\n"
-        "00:00:01.000 --> 00:00:04.000\n"
-        "Hello world\n\n"
-        "2\n"
-        "00:00:05.500 --> 00:00:07.000\n"
-        "Second line\n\n";
+    /* Casting starts (or a seek lands) 5s into the file: the first cue
+     * (1s-4s) is entirely before that and must be dropped; the second
+     * (5.5s-7s) must be shifted to start 0.5s into the new segment. */
+    char *webvtt = chromecast_ConvertSubtitleFileToWebVTT( obj, uri, VLC_TICK_FROM_SEC( 5 ) );
+    assert( webvtt != NULL );
+    std::string out( webvtt );
+    free( webvtt );
 
-    assert( chromecast_ConvertSubtitleToWebVTT( srt, true, 0 ) == expected );
+    assert( out.find( "Hello world" ) == std::string::npos );
+    assert( out.find( "00:00:00.500 --> 00:00:02.000" ) != std::string::npos );
+    assert( out.find( "Second line" ) != std::string::npos );
+
+    RemoveFixture( uri );
+    free( uri );
 }
 
-static void test_ConvertSubtitleToWebVTT_OffsetDropsPastCues()
+static void test_OffsetPastAllCuesYieldsNoTrack( vlc_object_t *obj )
 {
-    /* Casting starts (or a seek lands) at 00:00:05.000 into the file: cues
-     * that end before that point belong to a part of the file that isn't
-     * part of the current segment and must be dropped, not just shifted
-     * into negative timestamps. */
-    const std::string srt =
-        "1\n"
-        "00:00:01,000 --> 00:00:04,000\n"
-        "Dropped: entirely before the segment start\n"
-        "\n"
-        "2\n"
-        "00:00:04,500 --> 00:00:06,000\n"
-        "Clamped: starts before, ends after\n"
-        "\n"
-        "3\n"
-        "00:00:10,000 --> 00:00:12,000\n"
-        "Kept: entirely after\n";
+    char *uri = WriteFixture( SRT_FIXTURE );
 
-    const std::string webvtt = chromecast_ConvertSubtitleToWebVTT( srt, true, 5000 );
+    /* Every cue ends before a segment starting at 1 minute in: nothing to
+     * show for this segment at all, same as no subtitle slave. */
+    char *webvtt = chromecast_ConvertSubtitleFileToWebVTT( obj, uri, VLC_TICK_FROM_SEC( 60 ) );
+    assert( webvtt == NULL );
 
-    assert( webvtt.find( "Dropped" ) == std::string::npos );
-    assert( webvtt.find( "00:00:00.000 --> 00:00:01.000\nClamped" ) != std::string::npos );
-    assert( webvtt.find( "00:00:05.000 --> 00:00:07.000\nKept" ) != std::string::npos );
+    RemoveFixture( uri );
+    free( uri );
 }
 
-static void test_ConvertSubtitleToWebVTT_PassthroughVtt()
+static void test_MicroDVDGenerality( vlc_object_t *obj )
 {
-    const std::string vtt =
-        "WEBVTT\n"
-        "\n"
-        "00:00:01.000 --> 00:00:02.000\n"
-        "Already WebVTT\n";
+    /* A format with nothing in common with SRT (frame-number timing, no
+     * "-->" syntax at all): proves this isn't SRT-specific parsing. */
+    char *uri = WriteFixture( MICRODVD_FIXTURE );
 
-    const std::string webvtt = chromecast_ConvertSubtitleToWebVTT( vtt, false, 0 );
-    assert( webvtt.find( "WEBVTT\n\n" ) == 0 );
-    assert( webvtt.find( "00:00:01.000 --> 00:00:02.000\nAlready WebVTT\n" )
-            != std::string::npos );
+    char *webvtt = chromecast_ConvertSubtitleFileToWebVTT( obj, uri, 0 );
+    assert( webvtt != NULL );
+    std::string out( webvtt );
+    free( webvtt );
+
+    assert( out.find( "00:00:01.000 --> 00:00:04.000" ) != std::string::npos );
+    assert( out.find( "Frame-based cue one" ) != std::string::npos );
+    assert( out.find( "00:00:06.000 --> 00:00:08.000" ) != std::string::npos );
+    assert( out.find( "Frame-based cue two" ) != std::string::npos );
+
+    RemoveFixture( uri );
+    free( uri );
 }
 
-static void test_ConvertSubtitleToWebVTT_StripsBOM()
+static void test_StyledAssYieldsNoTrack( vlc_object_t *obj )
 {
-    const std::string srt =
-        "\xEF\xBB\xBF" "1\n00:00:01,000 --> 00:00:02,000\nHi\n";
+    char *uri = WriteFixture( ASS_FIXTURE );
 
-    const std::string webvtt = chromecast_ConvertSubtitleToWebVTT( srt, true, 0 );
-    /* The BOM must not leak into the output, in particular not right after
-     * the mandatory "WEBVTT" signature. */
-    assert( webvtt.compare( 0, 8, "WEBVTT\n\n" ) == 0 );
+    char *webvtt = chromecast_ConvertSubtitleFileToWebVTT( obj, uri, 0 );
+    assert( webvtt == NULL );
+
+    RemoveFixture( uri );
+    free( uri );
 }
 
-static void test_ConvertSubtitleToWebVTT_MalformedCuePassthrough()
+static void test_MissingFileYieldsNoTrack( vlc_object_t *obj )
 {
-    /* A block without a "-->" timing line (e.g. a WebVTT NOTE, or anything
-     * this parser doesn't understand) must be preserved rather than
-     * silently dropped. */
-    const std::string vtt =
-        "WEBVTT\n"
-        "\n"
-        "NOTE this is a comment\n"
-        "\n"
-        "00:00:01.000 --> 00:00:02.000\n"
-        "Real cue\n";
-
-    const std::string webvtt = chromecast_ConvertSubtitleToWebVTT( vtt, false, 0 );
-    assert( webvtt.find( "NOTE this is a comment" ) != std::string::npos );
-    assert( webvtt.find( "Real cue" ) != std::string::npos );
+    char *webvtt = chromecast_ConvertSubtitleFileToWebVTT(
+        obj, "file:///nonexistent/path/that/should/not/exist.srt", 0 );
+    assert( webvtt == NULL );
 }
 
 int main(void)
 {
-    test_HasExtension();
-    test_ParseVttTimestamp();
-    test_FormatVttTimestamp();
-    test_ConvertSubtitleToWebVTT_BasicSrt();
-    test_ConvertSubtitleToWebVTT_OffsetDropsPastCues();
-    test_ConvertSubtitleToWebVTT_PassthroughVtt();
-    test_ConvertSubtitleToWebVTT_StripsBOM();
-    test_ConvertSubtitleToWebVTT_MalformedCuePassthrough();
+    test_init();
+
+    const char *const args[] = { "-vvv" };
+    libvlc_instance_t *vlc = libvlc_new( 1, args );
+    assert( vlc != NULL );
+    vlc_object_t *obj = VLC_OBJECT( vlc->p_libvlc_int );
+
+    test_BasicSrt( obj );
+    test_SegmentOffsetDropsAndShiftsCues( obj );
+    test_OffsetPastAllCuesYieldsNoTrack( obj );
+    test_MicroDVDGenerality( obj );
+    test_StyledAssYieldsNoTrack( obj );
+    test_MissingFileYieldsNoTrack( obj );
+
+    libvlc_release( vlc );
     return 0;
 }

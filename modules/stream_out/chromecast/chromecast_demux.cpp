@@ -32,8 +32,6 @@
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
 #include <vlc_input_item.h>
-#include <vlc_stream.h>
-#include <vlc_strings.h>
 
 #include "chromecast_common.h"
 #include "chromecast_webvtt.h"
@@ -44,69 +42,6 @@
 #include <string>
 
 static void on_paused_changed_cb(void *data, bool paused);
-
-/**
- * Reads an external subtitle slave and, if it is a plain SRT or WebVTT
- * file, returns its content as a heap-allocated WebVTT document (to be
- * handed over to pf_set_subtitle, which takes ownership). Returns NULL for
- * anything else (embedded tracks, styled formats such as ASS/SSA, unreadable
- * or oversized files): those are simply not offered as a Cast sidecar track.
- */
-static char *LoadSubtitleAsWebVTT( vlc_object_t *p_obj, const char *psz_uri,
-                                   vlc_tick_t i_offset )
-{
-    bool is_srt = chromecast_HasExtension( psz_uri, "srt" );
-    bool is_vtt = !is_srt && ( chromecast_HasExtension( psz_uri, "vtt" )
-                            || chromecast_HasExtension( psz_uri, "webvtt" ) );
-    if( !is_srt && !is_vtt )
-    {
-        msg_Dbg( p_obj, "cc subtitle load: %s has no srt/vtt/webvtt extension", psz_uri );
-        return NULL;
-    }
-
-    stream_t *s = vlc_stream_NewURL( p_obj, psz_uri );
-    if( s == NULL )
-    {
-        msg_Warn( p_obj, "cc subtitle load: vlc_stream_NewURL failed for %s", psz_uri );
-        return NULL;
-    }
-
-    uint64_t size;
-    /* Subtitle files are tiny; refuse anything unreasonable rather than
-     * load a mismatched/huge resource into memory. */
-    if( vlc_stream_GetSize( s, &size ) != VLC_SUCCESS || size == 0
-     || size > INT64_C(4000000) )
-    {
-        msg_Warn( p_obj, "cc subtitle load: bad size for %s (size=%" PRIu64 ")", psz_uri, size );
-        vlc_stream_Delete( s );
-        return NULL;
-    }
-
-    char *psz_data = (char *)malloc( size + 1 );
-    if( psz_data == NULL )
-    {
-        vlc_stream_Delete( s );
-        return NULL;
-    }
-
-    ssize_t read = vlc_stream_Read( s, psz_data, size );
-    vlc_stream_Delete( s );
-    if( read <= 0 )
-    {
-        msg_Warn( p_obj, "cc subtitle load: read failed for %s (read=%zd)", psz_uri, read );
-        free( psz_data );
-        return NULL;
-    }
-    msg_Dbg( p_obj, "cc subtitle load: read %zd bytes from %s", read, psz_uri );
-    psz_data[read] = '\0';
-
-    std::string converted = chromecast_ConvertSubtitleToWebVTT( std::string( psz_data, read ),
-                                                                is_srt, MS_FROM_VLC_TICK( i_offset ) );
-    char *psz_webvtt = strdup( converted.c_str() );
-
-    free( psz_data );
-    return psz_webvtt;
-}
 
 struct demux_cc
 {
@@ -260,23 +195,19 @@ struct demux_cc
                         i, (int)p_slave->i_type, p_slave->psz_uri );
                 if( p_slave->i_type != SLAVE_TYPE_SPU )
                     continue;
-                /* Only plain SRT/WebVTT slaves can become a sidecar track;
-                 * keep looking if this one is a styled/unsupported format. */
-                if( chromecast_HasExtension( p_slave->psz_uri, "srt" )
-                 || chromecast_HasExtension( p_slave->psz_uri, "vtt" )
-                 || chromecast_HasExtension( p_slave->psz_uri, "webvtt" ) )
-                {
-                    uri = p_slave->psz_uri;
-                    break;
-                }
-                else
-                    msg_Dbg( p_demux, "cc subtitle scan: slave[%d] extension not srt/vtt/webvtt, skipping", i );
+                /* Take the first external SPU slave; whether it can
+                 * actually become a sidecar track is for the subtitle
+                 * demux/decode chain below to decide; it already has to
+                 * fail gracefully for embedded/unsupported formats, so
+                 * there is no format allowlist to maintain here. */
+                uri = p_slave->psz_uri;
+                break;
             }
             vlc_mutex_unlock( &p_item->lock );
         }
 
         if( uri.empty() )
-            msg_Dbg( p_demux, "cc subtitle scan: no matching external SRT/WebVTT slave found" );
+            msg_Dbg( p_demux, "cc subtitle scan: no external SPU slave found" );
         else
             msg_Dbg( p_demux, "cc subtitle scan: using slave uri=%s", uri.c_str() );
 
@@ -286,7 +217,8 @@ struct demux_cc
             offset = 0;
 
         char *psz_webvtt = uri.empty() ? NULL
-                          : LoadSubtitleAsWebVTT( VLC_OBJECT(p_demux), uri.c_str(), offset );
+                          : chromecast_ConvertSubtitleFileToWebVTT( VLC_OBJECT(p_demux),
+                                                                    uri.c_str(), offset );
         msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms)",
                 psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ) );
         p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );

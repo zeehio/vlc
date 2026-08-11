@@ -1,5 +1,6 @@
 /*****************************************************************************
- * chromecast_webvtt.h: SRT/WebVTT helpers for the Chromecast sidecar track
+ * chromecast_webvtt.h: convert a subtitle file to WebVTT for the Chromecast
+ * sidecar track, reusing VLC's own subtitle demux/decode chain
  *****************************************************************************
  * Copyright © 2015-2016 VideoLAN
  *
@@ -21,44 +22,44 @@
 #ifndef VLC_CHROMECAST_WEBVTT_H
 #define VLC_CHROMECAST_WEBVTT_H
 
-#include <cstdint>
-#include <string>
+#include <vlc_common.h>
 
 /**
- * \return true if psz_uri ends with '.' + psz_ext (case-insensitive)
- */
-bool chromecast_HasExtension( const char *psz_uri, const char *psz_ext );
-
-/**
- * Parses a "[HH:]MM:SS[.,]mmm" timestamp (SRT uses ',' as the decimal
- * separator, WebVTT uses '.'; both are accepted). Returns false if the
- * string doesn't match either form.
- */
-bool chromecast_ParseVttTimestamp( const std::string &s, int64_t *out_ms );
-
-/**
- * Formats a millisecond count as a WebVTT "HH:MM:SS.mmm" timestamp.
- * Negative values are clamped to 0.
- */
-std::string chromecast_FormatVttTimestamp( int64_t ms );
-
-/**
- * SRT and WebVTT share the same cue structure (an optional numeric
- * identifier line, a "start --> end" timing line, then one or more text
- * lines, cues separated by a blank line).
+ * Converts an external subtitle file to a WebVTT document, for use as a
+ * Chromecast sidecar text track.
  *
- * Cue timestamps in the source file are always relative to the file's own
- * 0:00. The Chromecast receiver's own playback clock however restarts near
- * 0 for every "segment" it is fed: at the initial LOAD, and again after
- * every seek (the Cast protocol has no concept of seeking within VLC's
- * live-restream, ES_OUT_RESET_PCR just tells the encoder to start a new
- * timestamp epoch and the receiver's clock follows that). i_offset_ms is
- * the source-file position (in ms) the current segment starts at: it is
- * subtracted from every cue so cues line up with the receiver's clock, and
- * any cue that ends before that point (i.e. it belongs to a part of the
- * file no longer being sent) is dropped.
+ * This reuses VLC's own subtitle demux/decode pipeline - the generic
+ * "subtitle" demuxer (SRT, MicroDVD, SAMI, SubViewer, and more) and the
+ * matching spu decoder - rather than a format-specific parser, so any
+ * text-based subtitle format VLC already understands is supported here for
+ * free, with correctly parsed timing. Unlike the 4.0 branch this is ported
+ * from, this VLC checkout has no WebVTT spu encoder or muxer module
+ * (modules/codec/webvtt/encvtt.c, modules/mux/webvtt.c) to hand the decoded
+ * cues to, so the WebVTT text itself is serialized directly here from the
+ * decoded subpicture regions instead.
+ *
+ * Formats that only decode to a bitmap/rendered representation (e.g. styled
+ * ASS/SSA via libass, or PGS, DVB, VobSub) cannot become WebVTT cues and
+ * correctly yield no output, same as if the slave had never been offered.
+ *
+ * \param p_parent object used as the demux/decoder's parent and for
+ *                 logging.
+ * \param psz_uri  URI of the external subtitle file.
+ * \param i_offset the source-file position (as returned by DEMUX_GET_TIME
+ *                 on the main content's demux) that the current Cast
+ *                 segment starts at: cues are shifted by this amount so
+ *                 they line up with the receiver's own clock (which
+ *                 restarts near 0 for every segment - see
+ *                 chromecast_demux.cpp for why), and any cue that ends up
+ *                 entirely before the segment start is dropped. Pass 0 to
+ *                 leave cues as they are in the source file.
+ * \return a heap-allocated, NUL-terminated WebVTT document (ownership
+ *         transferred to the caller, which must free() it), or NULL if the
+ *         file couldn't be parsed as a subtitle, or none of its cues could
+ *         be turned into WebVTT text.
  */
-std::string chromecast_ConvertSubtitleToWebVTT( const std::string &content, bool is_srt,
-                                                 int64_t i_offset_ms );
+char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
+                                              const char *psz_uri,
+                                              vlc_tick_t i_offset );
 
 #endif // VLC_CHROMECAST_WEBVTT_H

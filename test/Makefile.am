@@ -138,12 +138,14 @@ test_modules_demux_ts_pes_LDADD = $(LIBVLCCORE) $(LIBVLC)
 test_modules_demux_ts_pes_SOURCES = modules/demux/ts_pes.c \
 				../modules/demux/mpeg/ts_pes.c \
 				../modules/demux/mpeg/ts_pes.h
-# Pure string logic (no VLC dependency at all), so no LDADD is needed: the
-# sidecar generation code it tests is deliberately factored out of
-# chromecast_demux.cpp for this reason.
+# Exercises the real subtitle demux/decode chain (see
+# chromecast_webvtt.cpp's header comment for why), so it genuinely needs
+# libvlc plus the plugins that chain is made of.
 test_modules_stream_out_chromecast_webvtt_SOURCES = modules/stream_out/chromecast_webvtt.cpp \
 				../modules/stream_out/chromecast/chromecast_webvtt.cpp \
 				../modules/stream_out/chromecast/chromecast_webvtt.h
+test_modules_stream_out_chromecast_webvtt_CXXFLAGS = -DSRCDIR=\"$(srcdir)\"
+test_modules_stream_out_chromecast_webvtt_LDADD = $(LIBVLCCORE) $(LIBVLC)
 
 checkall:
 	$(MAKE) check_PROGRAMS="$(check_PROGRAMS) $(EXTRA_PROGRAMS)" check
