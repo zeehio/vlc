@@ -213,6 +213,7 @@ struct intf_sys_t
      */
     void setSourceDirect( bool active, const std::string &mime );
     bool isSourceDirect() const;
+    bool seekSource( vlc_tick_t time );
 
     /**
      * Whether cast.cpp has settled the direct-serve eligibility decision for the
@@ -284,6 +285,7 @@ private:
     static void set_source_info(void*, const char *psz_url, const char *psz_demux,
                                 bool b_can_seek);
     static bool is_source_direct(void*);
+    static bool seek_source(void*, vlc_tick_t time);
 
     void prepareHttpArtwork();
 

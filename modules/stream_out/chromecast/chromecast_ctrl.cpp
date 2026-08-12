@@ -219,6 +219,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_input_length = set_input_length;
     m_common.pf_set_source_info  = set_source_info;
     m_common.pf_is_source_direct = is_source_direct;
+    m_common.pf_seek             = seek_source;
 
     m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
     if( m_source_httpd_url != NULL )
@@ -454,6 +455,34 @@ bool intf_sys_t::is_source_direct( void *data )
 {
     intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
     return p_sys->isSourceDirect();
+}
+
+bool intf_sys_t::seekSource( vlc_tick_t time )
+{
+    vlc::threads::mutex_locker locker( m_lock );
+    if ( m_mediaSessionId == 0 || !m_communication )
+        return false;
+
+    m_last_request_id =
+        m_communication->msgPlayerSeek( m_appTransportId, m_mediaSessionId,
+                                        timeVLCToCC( time ) );
+    if ( m_last_request_id == ChromecastCommunication::kInvalidId )
+        return false;
+
+    /* Optimistically reflect the seek target right away, instead of
+     * waiting for the next polled GET_STATUS response (up to ~4s), so the
+     * local UI doesn't briefly show the pre-seek position. */
+    m_cc_time = time;
+    m_cc_time_date = vlc_tick_now();
+    m_cc_time_last_request_date = m_cc_time_date;
+
+    return true;
+}
+
+bool intf_sys_t::seek_source( void *data, vlc_tick_t time )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    return p_sys->seekSource( time );
 }
 
 void intf_sys_t::markEligibilityDecided()

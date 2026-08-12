@@ -96,6 +96,14 @@ typedef struct
      */
     bool (*pf_is_source_direct)(void *);
 
+    /**
+     * Direct-serve only: ask the receiver to seek to the given absolute position
+     * in the source it is reading directly, instead of seeking (and
+     * re-casting from) the local demux. Returns false if the request could
+     * not be sent (e.g. no media session yet).
+     */
+    bool (*pf_seek)(void *, vlc_tick_t time);
+
 } chromecast_common;
 
 # ifdef __cplusplus

@@ -457,6 +457,22 @@ unsigned ChromecastCommunication::msgPlayerPause( const std::string& destination
     return pushMediaPlayerMessage( destinationId, ss ) == VLC_SUCCESS ? id : kInvalidId;
 }
 
+unsigned ChromecastCommunication::msgPlayerSeek( const std::string& destinationId, int64_t mediaSessionId,
+                                                  const std::string & currentTime )
+{
+    assert(mediaSessionId != 0);
+    unsigned id = getNextRequestId();
+
+    std::stringstream ss;
+    ss << "{\"type\":\"SEEK\","
+       <<  "\"mediaSessionId\":" << mediaSessionId << ","
+       <<  "\"currentTime\":" << currentTime << ","
+       <<  "\"requestId\":" << id
+       << "}";
+
+    return pushMediaPlayerMessage( destinationId, ss ) == VLC_SUCCESS ? id : kInvalidId;
+}
+
 unsigned ChromecastCommunication::msgPlayerSetVolume( const std::string& destinationId, int64_t mediaSessionId, float f_volume, bool b_mute )
 {
     assert(mediaSessionId != 0);
