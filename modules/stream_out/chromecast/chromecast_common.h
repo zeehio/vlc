@@ -106,9 +106,12 @@ typedef struct
 
     /**
      * Whether cast.cpp has settled the direct-serve eligibility decision for the
-     * currently-known track set (whichever way it went). Code that needs
-     * the *real* answer, not a possibly-still-default one from before the
-     * first eligibility check ran, can wait on this instead of guessing.
+     * currently-known track set (whichever way it went). The subtitle scan
+     * waits for this before its first run, instead of generating a
+     * possibly-wrong provisional sidecar (using the wrong offset
+     * convention) and correcting it later, which risks the receiver
+     * rendering cues from that first, wrong fetch with no guarantee a
+     * reload actually clears them.
      */
     bool (*pf_is_eligibility_decided)(void *);
 

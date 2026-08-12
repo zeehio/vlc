@@ -52,6 +52,8 @@ struct demux_cc
         ,m_enabled( true )
         ,m_subtitle_scanned( false )
         ,m_subtitle_loaded_once( false )
+        ,m_subtitle_has_content( false )
+        ,m_subtitle_scan_was_direct_serve( false )
     {
         init();
     }
@@ -304,17 +306,33 @@ struct demux_cc
         else
             msg_Dbg( p_demux, "cc subtitle scan: using slave uri=%s", uri.c_str() );
 
+        /* Direct-serve: the receiver plays (and seeks) the source's own absolute
+         * timeline directly, so the sidecar track must match the file's
+         * own timestamps as-is. The offset below only exists to compensate
+         * for the live-restream path always re-casting from "now": each
+         * "segment" the receiver gets starts at zero, so subtitle cues
+         * need to be shifted back by however far into the file that
+         * segment actually starts.
+         *
+         * Whether this session is direct-serve is only known once cast.cpp has
+         * seen data flow through the sout chain at least once - which
+         * cannot happen before this, the very first Demux() call, returns.
+         * Callers wait for pf_is_eligibility_decided() before the first
+         * scan (see Demux() below) so this is never a guess. */
+        bool b_direct_serve = p_renderer->pf_is_source_direct( p_renderer->p_opaque );
         vlc_tick_t offset = 0;
-        if( !uri.empty()
+        if( !uri.empty() && !b_direct_serve
          && demux_Control( p_demux->s, DEMUX_GET_TIME, &offset ) != VLC_SUCCESS )
             offset = 0;
 
         char *psz_webvtt = uri.empty() ? NULL
                           : chromecast_ConvertSubtitleFileToWebVTT( VLC_OBJECT(p_demux),
                                                                     uri.c_str(), offset );
-        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms)",
-                psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ) );
+        msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms, direct_serve=%d)",
+                psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ), b_direct_serve );
         p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );
+        m_subtitle_has_content = psz_webvtt != NULL;
+        m_subtitle_scan_was_direct_serve = b_direct_serve;
 
         if( psz_webvtt != NULL )
         {
@@ -452,7 +470,28 @@ struct demux_cc
 
         if( !m_subtitle_scanned )
         {
-            m_subtitle_scanned = true;
+            /* Wait for direct-serve eligibility to be settled for the
+             * (now-fully-known) track set before the one-time scan,
+             * instead of scanning immediately and correcting later: a
+             * "scan now (possibly with the wrong offset), fix on the next
+             * call" approach means the receiver may fetch and start
+             * rendering a first, necessarily-wrong version of the sidecar
+             * before the corrected one replaces it - and there is no
+             * guarantee a reload actually clears cues already rendered
+             * from that first fetch, rather than layering the corrected
+             * ones on top of them. */
+            if( p_renderer->pf_is_eligibility_decided( p_renderer->p_opaque ) )
+            {
+                m_subtitle_scanned = true;
+                setSubtitleFromSlaves();
+            }
+        }
+        else if( m_subtitle_has_content
+              && m_subtitle_scan_was_direct_serve != p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
+        {
+            /* Direct-serve status changed since the scan (e.g. a track change
+             * flipped eligibility mid-session): regenerate the sidecar
+             * with the correct reference frame and reload the receiver. */
             setSubtitleFromSlaves();
         }
 
@@ -673,6 +712,8 @@ protected:
     bool          m_enabled;
     bool          m_subtitle_scanned;
     bool          m_subtitle_loaded_once;
+    bool          m_subtitle_has_content;
+    bool          m_subtitle_scan_was_direct_serve;
     bool          m_demux_eof;
     double        m_start_pos;
     double        m_last_pos;
