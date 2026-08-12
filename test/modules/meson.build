@@ -223,6 +223,17 @@ vlc_tests += {
 }
 
 vlc_tests += {
+    'name' : 'test_modules_stream_out_chromecast_http_range',
+    'sources' : files(
+        'stream_out/chromecast_http_range.cpp',
+        '../../modules/stream_out/chromecast/chromecast_http_range.cpp',
+        '../../modules/stream_out/chromecast/chromecast_http_range.h'),
+    'suite' : ['modules', 'test_modules'],
+    'link_with' : [libvlccore],
+    'module_depends' : vlc_plugins_targets.keys()
+}
+
+vlc_tests += {
     'name' : 'test_modules_mux_webvtt',
     'sources' : files('mux/webvtt.c'),
     'suite' : ['modules', 'test_modules'],
