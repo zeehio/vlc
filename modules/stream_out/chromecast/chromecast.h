@@ -40,6 +40,7 @@
 #include <atomic>
 #include <sstream>
 #include <queue>
+#include <map>
 
 #ifndef PROTOBUF_INLINE_NOT_IN_HEADERS
 # define PROTOBUF_INLINE_NOT_IN_HEADERS 0
@@ -188,10 +189,23 @@ struct intf_sys_t
     unsigned int getHttpStreamPort() const;
     std::string getHttpStreamPath() const;
     std::string getHttpArtRoot() const;
+    std::string getHttpSourcePath() const;
 
     std::string getDeviceName() const { return m_device_name; };
 
     int httpd_file_fill( uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data );
+    std::string getSourceUrl() const;
+    std::string getSourceMime() const;
+    /**
+     * Serve the original (untranscoded) source media bytes as-is over
+     * HTTP, honoring Range requests. Nothing points a Cast session at this
+     * yet; a follow-up change will use it to let the receiver seek within
+     * an already Chromecast-compatible source using its own container
+     * index, instead of going through the live-restream transcode/mux
+     * chain, which has no seekable index at all.
+     */
+    int httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
+                         const httpd_message_t *query );
     void interrupt_wake_up();
     void preservePlaybackOnTeardown();
 private:
@@ -302,6 +316,12 @@ private:
     std::string       m_art_http_ip;
     char             *m_art_url;
     unsigned          m_art_idx;
+
+    std::string       m_source_url;
+    std::string       m_source_mime;
+    struct SourceStreamClient;
+    httpd_url_t                                    *m_source_httpd_url;
+    std::map<httpd_client_t *, SourceStreamClient *> m_source_clients;
 
     vlc_tick_t        m_cc_time_last_request_date;
     vlc_tick_t        m_cc_time_date;

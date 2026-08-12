@@ -32,9 +32,11 @@
 #endif
 
 #include "chromecast.h"
+#include "chromecast_http_range.h"
 
 #include <cassert>
 #include <cerrno>
+#include <cinttypes>
 #include <iomanip>
 #include <string_view>
 
@@ -50,6 +52,14 @@ extern "C" {
 /* deadline regarding pings sent from receiver */
 #define PING_WAIT_TIME 6000
 #define PING_WAIT_RETRIES 1
+
+#define SOURCE_STREAM_CHUNK 262144 /* 256kB */
+
+struct intf_sys_t::SourceStreamClient
+{
+    stream_t *p_stream;
+    uint64_t  i_remaining;
+};
 
 extern "C" {
 
@@ -92,6 +102,20 @@ static inline std::string_view json_get_str_view(const struct json_object *obj, 
 
 static int httpd_file_fill_cb( httpd_file_sys_t *data, httpd_file_t *http_file,
                           uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data );
+
+static int httpd_source_cb_wrapper( httpd_callback_sys_t *data, httpd_client_t *cl,
+                                    httpd_message_t *answer, const httpd_message_t *query );
+
+static void source_cb_error( httpd_message_t *answer, int i_status )
+{
+    answer->i_proto  = HTTPD_PROTO_HTTP;
+    answer->i_version= 0;
+    answer->i_type   = HTTPD_MSG_ANSWER;
+    answer->i_status = i_status;
+    answer->i_body   = 0;
+    httpd_MsgAdd( answer, "Content-Length", "0" );
+    httpd_MsgAdd( answer, "Connection", "close" );
+}
 
 static const char* StateToStr( States s )
 {
@@ -160,6 +184,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_httpd_file(NULL)
  , m_art_url(NULL)
  , m_art_idx(0)
+ , m_source_httpd_url(NULL)
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
  , m_pingRetriesLeft( PING_WAIT_RETRIES )
@@ -189,6 +214,13 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_pause_state  = set_pause_state;
     m_common.pf_set_meta         = set_meta;
     m_common.pf_set_input_length = set_input_length;
+
+    m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
+    if( m_source_httpd_url != NULL )
+        httpd_UrlCatch( m_source_httpd_url, HTTPD_MSG_GET, httpd_source_cb_wrapper,
+                        (httpd_callback_sys_t *) this );
+    else
+        msg_Warn( p_this, "failed to register the Chromecast direct-source URL" );
 
     assert( var_Type( vlc_object_parent(vlc_object_parent(m_module)), CC_SHARED_VAR_NAME) == 0 );
     if (var_Create( vlc_object_parent(vlc_object_parent(m_module)), CC_SHARED_VAR_NAME, VLC_VAR_ADDRESS ) == VLC_SUCCESS )
@@ -249,6 +281,16 @@ intf_sys_t::~intf_sys_t()
         httpd_FileDelete( m_httpd_file );
 
     free( m_art_url );
+
+    if( m_source_httpd_url )
+        httpd_UrlDelete( m_source_httpd_url );
+
+    for( std::map<httpd_client_t *, SourceStreamClient *>::iterator it = m_source_clients.begin();
+         it != m_source_clients.end(); ++it )
+    {
+        vlc_stream_Delete( it->second->p_stream );
+        delete it->second;
+    }
 }
 
 void intf_sys_t::preservePlaybackOnTeardown()
@@ -343,6 +385,166 @@ static int httpd_file_fill_cb( httpd_file_sys_t *data, httpd_file_t *,
 {
     intf_sys_t *p_sys = static_cast<intf_sys_t*>((void *)data);
     return p_sys->httpd_file_fill( psz_request, pp_data, pi_data );
+}
+
+std::string intf_sys_t::getSourceUrl() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_source_url;
+}
+
+std::string intf_sys_t::getSourceMime() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_source_mime;
+}
+
+int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
+                                 const httpd_message_t *query )
+{
+    if( !answer || !query || !cl )
+        return VLC_SUCCESS;
+
+    answer->i_proto  = HTTPD_PROTO_HTTP;
+    answer->i_version= 0;
+    answer->i_type   = HTTPD_MSG_ANSWER;
+
+    SourceStreamClient *p_client;
+
+    if( answer->i_body_offset == 0 )
+    {
+        /* Start of a new request: drop any stale state left over for this
+         * client slot (e.g. a previous request on a re-used connection). */
+        SourceStreamClient *p_stale = NULL;
+        {
+            vlc::threads::mutex_locker lock( m_lock );
+            std::map<httpd_client_t *, SourceStreamClient *>::iterator it =
+                m_source_clients.find( cl );
+            if( it != m_source_clients.end() )
+            {
+                p_stale = it->second;
+                m_source_clients.erase( it );
+            }
+        }
+        if( p_stale != NULL )
+        {
+            vlc_stream_Delete( p_stale->p_stream );
+            delete p_stale;
+        }
+
+        std::string url = getSourceUrl();
+        std::string mime = getSourceMime();
+        if( url.empty() )
+        {
+            source_cb_error( answer, 404 );
+            return VLC_SUCCESS;
+        }
+
+        stream_t *p_stream = vlc_stream_NewURL( m_module, url.c_str() );
+        uint64_t i_size = 0;
+        if( p_stream == NULL || vlc_stream_GetSize( p_stream, &i_size ) != VLC_SUCCESS
+         || i_size == 0 )
+        {
+            if( p_stream != NULL )
+                vlc_stream_Delete( p_stream );
+            source_cb_error( answer, 404 );
+            return VLC_SUCCESS;
+        }
+
+        uint64_t i_start, i_end;
+        bool b_partial = chromecast_ParseByteRange( query, i_size, &i_start, &i_end );
+
+        if( vlc_stream_Seek( p_stream, i_start ) != VLC_SUCCESS )
+        {
+            vlc_stream_Delete( p_stream );
+            source_cb_error( answer, 500 );
+            return VLC_SUCCESS;
+        }
+
+        if( query->i_type == HTTPD_MSG_HEAD )
+        {
+            vlc_stream_Delete( p_stream );
+            answer->i_status = b_partial ? 206 : 200;
+            answer->i_body = 0;
+            httpd_MsgAdd( answer, "Content-type", "%s",
+                         mime.empty() ? "application/octet-stream" : mime.c_str() );
+            httpd_MsgAdd( answer, "Accept-Ranges", "bytes" );
+            httpd_MsgAdd( answer, "Content-Length", "%" PRIu64, i_end - i_start + 1 );
+            httpd_MsgAdd( answer, "Connection", "close" );
+            return VLC_SUCCESS;
+        }
+
+        p_client = new SourceStreamClient;
+        p_client->p_stream = p_stream;
+        p_client->i_remaining = i_end - i_start + 1;
+
+        {
+            vlc::threads::mutex_locker lock( m_lock );
+            m_source_clients[cl] = p_client;
+        }
+
+        answer->i_status = b_partial ? 206 : 200;
+        httpd_MsgAdd( answer, "Content-type", "%s",
+                     mime.empty() ? "application/octet-stream" : mime.c_str() );
+        httpd_MsgAdd( answer, "Accept-Ranges", "bytes" );
+        httpd_MsgAdd( answer, "Cache-Control", "no-cache" );
+        httpd_MsgAdd( answer, "Content-Length", "%" PRIu64, p_client->i_remaining );
+        if( b_partial )
+            httpd_MsgAdd( answer, "Content-Range", "bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64,
+                         i_start, i_end, i_size );
+    }
+    else
+    {
+        vlc::threads::mutex_locker lock( m_lock );
+        std::map<httpd_client_t *, SourceStreamClient *>::iterator it =
+            m_source_clients.find( cl );
+        if( it == m_source_clients.end() )
+        {
+            answer->i_body = 0;
+            httpd_MsgAdd( answer, "Connection", "close" );
+            return VLC_SUCCESS;
+        }
+        p_client = it->second;
+    }
+
+    size_t i_chunk = SOURCE_STREAM_CHUNK;
+    if( (uint64_t)i_chunk > p_client->i_remaining )
+        i_chunk = (size_t)p_client->i_remaining;
+
+    uint8_t *p_buf = i_chunk > 0 ? (uint8_t *)malloc( i_chunk ) : NULL;
+    ssize_t i_read = ( p_buf != NULL ) ? vlc_stream_Read( p_client->p_stream, p_buf, i_chunk ) : 0;
+
+    if( i_chunk == 0 || p_buf == NULL || i_read <= 0 )
+    {
+        free( p_buf );
+        answer->i_body = 0;
+        httpd_MsgAdd( answer, "Connection", "close" );
+
+        {
+            vlc::threads::mutex_locker lock( m_lock );
+            m_source_clients.erase( cl );
+        }
+        vlc_stream_Delete( p_client->p_stream );
+        delete p_client;
+        return VLC_SUCCESS;
+    }
+
+    answer->p_body = p_buf;
+    answer->i_body = (size_t)i_read;
+    answer->i_body_offset += answer->i_body;
+    p_client->i_remaining -= (uint64_t)i_read;
+
+    if( p_client->i_remaining == 0 )
+        httpd_MsgAdd( answer, "Connection", "close" );
+
+    return VLC_SUCCESS;
+}
+
+static int httpd_source_cb_wrapper( httpd_callback_sys_t *data, httpd_client_t *cl,
+                                    httpd_message_t *answer, const httpd_message_t *query )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>((void *)data);
+    return p_sys->httpd_source_cb( cl, answer, query );
 }
 
 void intf_sys_t::prepareHttpArtwork()
@@ -1217,6 +1419,11 @@ std::string intf_sys_t::getHttpStreamPath() const
 std::string intf_sys_t::getHttpArtRoot() const
 {
     return m_httpd.m_root + "/art";
+}
+
+std::string intf_sys_t::getHttpSourcePath() const
+{
+    return m_httpd.m_root + "/original";
 }
 
 bool intf_sys_t::isFinishedPlaying()
