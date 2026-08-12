@@ -203,6 +203,8 @@ struct intf_sys_t
     std::string getSourceDemux() const;
     bool getSourceCanSeek() const;
     vlc_tick_t getInputLength() const;
+    void setStartTime( vlc_tick_t time );
+    vlc_tick_t getStartTime() const;
 
     /**
      * Direct-serve: the receiver is being pointed directly at the original
@@ -287,6 +289,8 @@ private:
                                 bool b_can_seek);
     static bool is_source_direct(void*);
     static bool seek_source(void*, vlc_tick_t time);
+    static bool is_eligibility_decided(void*);
+    static void set_start_time(void*, vlc_tick_t time);
 
     void prepareHttpArtwork();
 
@@ -358,6 +362,7 @@ private:
     struct SourceStreamClient;
     httpd_url_t                                    *m_source_httpd_url;
     std::map<httpd_client_t *, SourceStreamClient *> m_source_clients;
+    vlc_tick_t        m_start_time;
 
     vlc_tick_t        m_cc_time_last_request_date;
     vlc_tick_t        m_cc_time_date;

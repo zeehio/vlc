@@ -188,6 +188,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_source_direct(false)
  , m_eligibility_decided(false)
  , m_source_httpd_url(NULL)
+ , m_start_time( VLC_TICK_INVALID )
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
  , m_pingRetriesLeft( PING_WAIT_RETRIES )
@@ -220,6 +221,8 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_source_info  = set_source_info;
     m_common.pf_is_source_direct = is_source_direct;
     m_common.pf_seek             = seek_source;
+    m_common.pf_is_eligibility_decided = is_eligibility_decided;
+    m_common.pf_set_start_time   = set_start_time;
 
     m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
     if( m_source_httpd_url != NULL )
@@ -497,6 +500,30 @@ bool intf_sys_t::isEligibilityDecided() const
     return m_eligibility_decided;
 }
 
+bool intf_sys_t::is_eligibility_decided( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    return p_sys->isEligibilityDecided();
+}
+
+void intf_sys_t::setStartTime( vlc_tick_t time )
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    m_start_time = time;
+}
+
+vlc_tick_t intf_sys_t::getStartTime() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_start_time;
+}
+
+void intf_sys_t::set_start_time( void *data, vlc_tick_t time )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setStartTime( time );
+}
+
 int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
                                  const httpd_message_t *query )
 {
@@ -722,14 +749,23 @@ void intf_sys_t::tryLoad()
      * itself. m_lock is already held here, so m_source_direct is read
      * directly instead of through isSourceDirect(). */
     std::string contentPath;
+    vlc_tick_t startTime = VLC_TICK_INVALID;
     if( m_source_direct )
+    {
         contentPath = getHttpSourcePath();
+        startTime = m_start_time;
+        /* Consume it: this LOAD (or a later one within the same session,
+         * e.g. triggered by a track change) must not keep resending the
+         * position local playback happened to be at when the session
+         * started, once the receiver has since moved on its own. */
+        m_start_time = VLC_TICK_INVALID;
+    }
 
     // Reset the mediaSessionID to allow the new session to become the current one.
     // we cannot start a new load when the last one is still processing
     m_last_request_id =
         m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, m_input_length,
-                                        contentPath );
+                                        contentPath, startTime );
     if( m_last_request_id != ChromecastCommunication::kInvalidId )
         m_state = Loading;
 }

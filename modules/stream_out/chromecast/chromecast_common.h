@@ -104,6 +104,23 @@ typedef struct
      */
     bool (*pf_seek)(void *, vlc_tick_t time);
 
+    /**
+     * Whether cast.cpp has settled the direct-serve eligibility decision for the
+     * currently-known track set (whichever way it went). Code that needs
+     * the *real* answer, not a possibly-still-default one from before the
+     * first eligibility check ran, can wait on this instead of guessing.
+     */
+    bool (*pf_is_eligibility_decided)(void *);
+
+    /**
+     * Direct-serve only: report the position local playback was already at when
+     * this cast session started (e.g. resuming a video, or attaching a
+     * renderer to a playback already in progress), so the initial LOAD can
+     * ask the receiver to start there directly instead of at the
+     * beginning of the source.
+     */
+    void (*pf_set_start_time)(void *, vlc_tick_t time);
+
 } chromecast_common;
 
 # ifdef __cplusplus
