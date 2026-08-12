@@ -403,13 +403,22 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
 
 unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
                                              const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
-                                             const std::string& contentPath )
+                                             const std::string& contentPath,
+                                             vlc_tick_t i_start_time )
 {
     unsigned id = getNextRequestId();
     std::stringstream ss;
     ss << "{\"type\":\"LOAD\","
-       <<  "\"media\":{" << GetMedia( mime, p_meta, input_length, contentPath ) << "},"
-       <<  "\"requestId\":" << id
+       <<  "\"media\":{" << GetMedia( mime, p_meta, input_length, contentPath ) << "},";
+    /* Only meaningful (and only sent) for a direct-serve contentPath: the
+     * receiver plays the source's own absolute timeline, so without this
+     * it always starts a fresh LOAD from position 0, restarting a file
+     * that was already partway through playing locally when casting
+     * started. The live-restream path's own stream already only contains
+     * data from the current position onwards, so it doesn't need this. */
+    if( i_start_time > 0 )
+        ss << "\"currentTime\":" << secf_from_vlc_tick( i_start_time ) << ",";
+    ss <<  "\"requestId\":" << id
        << "}";
 
     return pushMediaPlayerMessage( destinationId, ss ) == VLC_SUCCESS ? id : kInvalidId;

@@ -124,7 +124,8 @@ public:
     unsigned msgAuth();
     unsigned msgPlayerLoad( const std::string& destinationId,
                             const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
-                            const std::string& contentPath = std::string() );
+                            const std::string& contentPath = std::string(),
+                            vlc_tick_t i_start_time = VLC_TICK_INVALID );
     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
