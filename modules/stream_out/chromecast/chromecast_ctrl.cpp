@@ -633,6 +633,11 @@ int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
                      mime.empty() ? "application/octet-stream" : mime.c_str() );
         httpd_MsgAdd( answer, "Accept-Ranges", "bytes" );
         httpd_MsgAdd( answer, "Cache-Control", "no-cache" );
+        /* Required as soon as a sidecar text track is added to the LOAD
+         * request: the Cast receiver enforces CORS on the main media
+         * resource too, not just on the track resource, once any track
+         * is present. */
+        httpd_MsgAdd( answer, "Access-Control-Allow-Origin", "*" );
         httpd_MsgAdd( answer, "Content-Length", "%" PRIu64, p_client->i_remaining );
         if( b_partial )
             httpd_MsgAdd( answer, "Content-Range", "bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64,
