@@ -123,7 +123,8 @@ public:
     unsigned msgReceiverClose(const std::string& destinationId);
     unsigned msgAuth();
     unsigned msgPlayerLoad( const std::string& destinationId,
-                            const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
+                            const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
+                            const std::string& contentPath = std::string() );
     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
@@ -144,7 +145,8 @@ private:
                      const std::string & destinationId = DEFAULT_CHOMECAST_RECEIVER,
                      castchannel::CastMessage_PayloadType payloadType = castchannel::CastMessage_PayloadType_STRING);
     int pushMediaPlayerMessage( const std::string& destinationId, const std::stringstream & payload );
-    std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
+    std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
+                          const std::string& contentPath );
     unsigned getNextReceiverRequestId();
     unsigned getNextRequestId();
 

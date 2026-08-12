@@ -305,7 +305,8 @@ std::string ChromecastCommunication::getServerBaseURL() const
 
 std::string ChromecastCommunication::GetMedia( const std::string& mime,
                                                const vlc_meta_t *p_meta,
-                                               vlc_tick_t input_length )
+                                               vlc_tick_t input_length,
+                                               const std::string& contentPath )
 {
     std::stringstream ss;
 
@@ -365,11 +366,18 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
         }
     }
 
-    const std::string chromecast_url = getServerBaseURL() + m_serverPath;
+    const std::string chromecast_url = getServerBaseURL() +
+        ( contentPath.empty() ? m_serverPath : contentPath );
 
     msg_Dbg( m_module, "s_chromecast_url: %s", chromecast_url.c_str());
 
-    const bool is_buffered = input_length > VLC_TICK_0;
+    /* Only declare "BUFFERED" (with a real duration, unlocking the
+     * receiver's native seek bar and remote/touch seek gestures) when
+     * contentId points at the direct-source endpoint: that's the only case
+     * where a real seekable container index sits behind it. Ordinary
+     * live-restream content has no such index - even though its duration
+     * may be known - so it must not claim to be seekable. */
+    const bool is_buffered = input_length > VLC_TICK_0 && !contentPath.empty();
     const char *stream_type;
     if (is_buffered)
         stream_type = "BUFFERED";
@@ -394,12 +402,13 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
 }
 
 unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
-                                             const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length )
+                                             const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length,
+                                             const std::string& contentPath )
 {
     unsigned id = getNextRequestId();
     std::stringstream ss;
     ss << "{\"type\":\"LOAD\","
-       <<  "\"media\":{" << GetMedia( mime, p_meta, input_length ) << "},"
+       <<  "\"media\":{" << GetMedia( mime, p_meta, input_length, contentPath ) << "},"
        <<  "\"requestId\":" << id
        << "}";
 
