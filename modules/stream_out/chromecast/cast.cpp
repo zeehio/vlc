@@ -41,6 +41,7 @@
 #include <vlc_httpd.h>
 
 #include <cassert>
+#include <cinttypes>
 
 #define TRANSCODING_NONE 0x0
 #define TRANSCODING_VIDEO 0x1
@@ -110,6 +111,7 @@ struct sout_stream_sys_t
         , transcoding_state( TRANSCODING_NONE )
         , venc_opt_idx ( -1 )
         , out_streams_added( 0 )
+        , direct_serve_active( false )
     {
         assert(p_intf != NULL);
         vlc_mutex_init(&lock);
@@ -159,6 +161,11 @@ struct sout_stream_sys_t
     std::vector<sout_stream_id_sys_t*> out_streams;
     unsigned int                       out_streams_added;
     unsigned int                       spu_streams_count;
+
+    /* Direct-serve: this session serves the original source bytes directly
+     * (see intf_sys_t::setSourceDirect) instead of going through the
+     * transcode/mux chain below. Send() drops blocks unread in this mode. */
+    bool                                direct_serve_active;
 
 private:
     std::string GetAcodecOption( sout_stream_t *, vlc_fourcc_t *, const audio_format_t *, int );
@@ -722,25 +729,27 @@ static void DelInternal(sout_stream_t *p_stream, void *_id, bool reset_config)
         sout_stream_id_sys_t *p_sys_id = *it;
         if ( p_sys_id == id )
         {
-            if ( p_sys_id->p_sub_id != NULL )
+            /* Also true for a direct-serve stream, whose p_sub_id is always NULL
+             * (there is no p_out chain to add it to): it still needs to be
+             * dropped from out_streams here, or the pointer freed below
+             * would be left dangling in that vector. */
+            for (std::vector<sout_stream_id_sys_t*>::iterator out_it = p_sys->out_streams.begin();
+                 out_it != p_sys->out_streams.end(); )
             {
-                sout_StreamIdDel( p_sys->p_out, p_sys_id->p_sub_id );
-                for (std::vector<sout_stream_id_sys_t*>::iterator out_it = p_sys->out_streams.begin();
-                     out_it != p_sys->out_streams.end(); )
+                if (*out_it == id)
                 {
-                    if (*out_it == id)
-                    {
-                        p_sys->out_streams.erase(out_it);
-                        p_sys->es_changed = reset_config;
-                        p_sys->out_force_reload = reset_config;
-                        if( p_sys_id->fmt.i_cat == VIDEO_ES )
-                            p_sys->has_video = false;
-                        else if( p_sys_id->fmt.i_cat == SPU_ES )
-                            p_sys->spu_streams_count--;
-                        break;
-                    }
-                    out_it++;
+                    if ( p_sys_id->p_sub_id != NULL )
+                        sout_StreamIdDel( p_sys->p_out, p_sys_id->p_sub_id );
+                    p_sys->out_streams.erase(out_it);
+                    p_sys->es_changed = reset_config;
+                    p_sys->out_force_reload = reset_config;
+                    if( p_sys_id->fmt.i_cat == VIDEO_ES )
+                        p_sys->has_video = false;
+                    else if( p_sys_id->fmt.i_cat == SPU_ES )
+                        p_sys->spu_streams_count--;
+                    break;
                 }
+                out_it++;
             }
 
             es_format_Clean( &p_sys_id->fmt );
@@ -753,7 +762,13 @@ static void DelInternal(sout_stream_t *p_stream, void *_id, bool reset_config)
 
     if ( p_sys->out_streams.empty() )
     {
-        if (p_sys->access_out_live.waitForClient(CHROMECAST_HANDOFF_ATTACH_TIMEOUT))
+        /* The handoff-attach wait is only meaningful for the live-restream
+         * chain: a direct-serve session has no access_out_live client to ever
+         * attach (the receiver reads the source directly), so waiting here
+         * would just stall teardown for CHROMECAST_HANDOFF_ATTACH_TIMEOUT
+         * for nothing. */
+        if ( !p_sys->direct_serve_active
+          && p_sys->access_out_live.waitForClient(CHROMECAST_HANDOFF_ATTACH_TIMEOUT))
         {
             p_sys->access_out_live.waitForClient(CHROMECAST_HANDOFF_ATTACH_TIMEOUT, true);
             p_sys->p_intf->preservePlaybackOnTeardown();
@@ -762,6 +777,11 @@ static void DelInternal(sout_stream_t *p_stream, void *_id, bool reset_config)
         p_sys->p_intf->requestPlayerStop();
         p_sys->access_out_live.clear();
         p_sys->transcoding_state = TRANSCODING_NONE;
+        if ( p_sys->direct_serve_active )
+        {
+            p_sys->direct_serve_active = false;
+            p_sys->p_intf->setSourceDirect( false, std::string() );
+        }
     }
 }
 
@@ -1079,6 +1099,69 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
 
     out_force_reload = false;
 
+    /* Direct-serve: if the source is already a finite, seekable, Chromecast-
+     * compatible file (canRemux, plus a container the receiver can index
+     * itself), skip the transcode/mux chain entirely and point the
+     * receiver at the source's own bytes. This gives it a real container
+     * index to seek against, unlike the live-restream chain below, which
+     * has none. */
+    /* Whatever this decides below (b_direct_serve true, false, or unreachable
+     * because canRemux is false), the decision itself is now final for the
+     * currently-known track set. */
+    p_intf->markEligibilityDecided();
+
+    bool b_direct_serve = false;
+    std::string direct_serve_mime;
+    if ( canRemux )
+    {
+        std::string source_demux = p_intf->getSourceDemux();
+        bool b_container_ok = ( source_demux == "mp4" || source_demux == "mkv" );
+        bool b_can_seek = p_intf->getSourceCanSeek();
+        vlc_tick_t i_input_length = p_intf->getInputLength();
+        bool b_url_ok = !p_intf->getSourceUrl().empty();
+        msg_Dbg( p_stream, "direct-serve check: canRemux=1 demux=\"%s\" container_ok=%d "
+                "can_seek=%d length=%" PRId64 " url_ok=%d",
+                source_demux.c_str(), b_container_ok, b_can_seek,
+                (int64_t)i_input_length, b_url_ok );
+        if ( b_container_ok && b_can_seek && i_input_length > 0 && b_url_ok )
+        {
+            const bool b_source_webm = ( i_codec_audio == VLC_CODEC_VORBIS ||
+                                        i_codec_audio == VLC_CODEC_OPUS ) &&
+                                       ( i_codec_video == VLC_CODEC_VP8 ||
+                                        i_codec_video == VLC_CODEC_VP9 );
+            b_direct_serve = true;
+            if ( source_demux == "mp4" )
+                direct_serve_mime = p_original_video ? "video/mp4" : "audio/mp4";
+            else
+                direct_serve_mime = b_source_webm
+                    ? ( p_original_video ? "video/webm" : "audio/webm" )
+                    : ( p_original_video ? "video/x-matroska" : "audio/x-matroska" );
+        }
+    }
+    else
+        msg_Dbg( p_stream, "direct-serve check: canRemux=0, skipping" );
+
+    if ( b_direct_serve )
+    {
+        stopSoutChain( p_stream );
+        access_out_live.clear();
+        out_streams = new_streams;
+        direct_serve_active = true;
+        mime = direct_serve_mime;
+        p_intf->setSourceDirect( true, direct_serve_mime );
+        p_intf->setRetryOnFail( false );
+        p_intf->setHasInput( direct_serve_mime );
+        return true;
+    }
+
+    if ( direct_serve_active )
+    {
+        /* No longer eligible (e.g. the track set changed): fall back to
+         * the normal transcode/live-restream path below. */
+        direct_serve_active = false;
+        p_intf->setSourceDirect( false, std::string() );
+    }
+
     std::stringstream ssout;
     int new_transcoding_state = TRANSCODING_NONE;
     if ( !canRemux )
@@ -1214,6 +1297,14 @@ static int Send(sout_stream_t *p_stream, void *_id, block_t *p_buffer)
     }
 
     sout_stream_id_sys_t *next_id = p_sys->GetSubId( p_stream, id );
+
+    if ( p_sys->direct_serve_active )
+    {
+        /* The receiver reads the source directly; nothing to forward. */
+        block_ChainRelease( p_buffer );
+        return VLC_SUCCESS;
+    }
+
     if ( next_id == NULL )
     {
         block_ChainRelease( p_buffer );

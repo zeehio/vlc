@@ -185,6 +185,8 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_art_url(NULL)
  , m_art_idx(0)
  , m_source_can_seek(false)
+ , m_source_direct(false)
+ , m_eligibility_decided(false)
  , m_source_httpd_url(NULL)
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
@@ -216,6 +218,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_meta         = set_meta;
     m_common.pf_set_input_length = set_input_length;
     m_common.pf_set_source_info  = set_source_info;
+    m_common.pf_is_source_direct = is_source_direct;
 
     m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
     if( m_source_httpd_url != NULL )
@@ -426,6 +429,43 @@ bool intf_sys_t::getSourceCanSeek() const
 {
     vlc::threads::mutex_locker lock( m_lock );
     return m_source_can_seek;
+}
+
+vlc_tick_t intf_sys_t::getInputLength() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_input_length;
+}
+
+void intf_sys_t::setSourceDirect( bool active, const std::string &mime )
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    m_source_direct = active;
+    m_source_mime = mime;
+}
+
+bool intf_sys_t::isSourceDirect() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_source_direct;
+}
+
+bool intf_sys_t::is_source_direct( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    return p_sys->isSourceDirect();
+}
+
+void intf_sys_t::markEligibilityDecided()
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    m_eligibility_decided = true;
+}
+
+bool intf_sys_t::isEligibilityDecided() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_eligibility_decided;
 }
 
 int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,
@@ -647,10 +687,20 @@ void intf_sys_t::tryLoad()
 
     // We should now be in the ready state, and therefore have a valid transportId
     assert( m_appTransportId.empty() == false );
+
+    /* Direct-serve: point contentId at the direct-source endpoint instead of the
+     * live-restream one, so the receiver indexes and seeks the source
+     * itself. m_lock is already held here, so m_source_direct is read
+     * directly instead of through isSourceDirect(). */
+    std::string contentPath;
+    if( m_source_direct )
+        contentPath = getHttpSourcePath();
+
     // Reset the mediaSessionID to allow the new session to become the current one.
     // we cannot start a new load when the last one is still processing
     m_last_request_id =
-        m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, m_input_length );
+        m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, m_input_length,
+                                        contentPath );
     if( m_last_request_id != ChromecastCommunication::kInvalidId )
         m_state = Loading;
 }

@@ -85,6 +85,17 @@ typedef struct
     void (*pf_set_source_info)(void *, const char *psz_url, const char *psz_demux,
                                bool b_can_seek);
 
+    /**
+     * Whether this session serves the original source bytes directly
+     * (Range-capable, over the URL pf_set_source_info reported) instead of
+     * the transcode/live-restream chain, because the source is already a
+     * Chromecast-compatible, finite, seekable file. Set once the sout has
+     * seen the track set and decided; read by the demux filter to decide
+     * whether local playback position/seeking should defer to the
+     * receiver instead of the local demux.
+     */
+    bool (*pf_is_source_direct)(void *);
+
 } chromecast_common;
 
 # ifdef __cplusplus

@@ -201,6 +201,27 @@ struct intf_sys_t
     void setSourceInfo( const char *psz_url, const char *psz_demux, bool b_can_seek );
     std::string getSourceDemux() const;
     bool getSourceCanSeek() const;
+    vlc_tick_t getInputLength() const;
+
+    /**
+     * Direct-serve: the receiver is being pointed directly at the original
+     * source bytes (served as-is, Range-capable, through
+     * getHttpSourcePath()) instead of the live-restream transcode/mux
+     * chain, because the source is already a Chromecast-compatible,
+     * finite, seekable file. Set once by cast.cpp when it decides whether
+     * a session is eligible.
+     */
+    void setSourceDirect( bool active, const std::string &mime );
+    bool isSourceDirect() const;
+
+    /**
+     * Whether cast.cpp has settled the direct-serve eligibility decision for the
+     * currently-known track set (whichever way it went). Code that needs
+     * the *real* answer, not a possibly-still-default one from before the
+     * first UpdateOutput() ran, can wait on this instead of guessing.
+     */
+    void markEligibilityDecided();
+    bool isEligibilityDecided() const;
     /**
      * Serve the original (untranscoded) source media bytes as-is over
      * HTTP, honoring Range requests. Nothing points a Cast session at this
@@ -262,6 +283,7 @@ private:
     static void set_input_length(void*, vlc_tick_t length);
     static void set_source_info(void*, const char *psz_url, const char *psz_demux,
                                 bool b_can_seek);
+    static bool is_source_direct(void*);
 
     void prepareHttpArtwork();
 
@@ -328,6 +350,8 @@ private:
     std::string       m_source_demux;
     bool              m_source_can_seek;
     std::string       m_source_mime;
+    bool              m_source_direct;
+    bool              m_eligibility_decided;
     struct SourceStreamClient;
     httpd_url_t                                    *m_source_httpd_url;
     std::map<httpd_client_t *, SourceStreamClient *> m_source_clients;
