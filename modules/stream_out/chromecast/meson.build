@@ -59,6 +59,8 @@ vlc_modules += {
         'chromecast_common.h',
         'chromecast_ctrl.cpp',
         'chromecast_communication.cpp',
+        'chromecast_http_range.cpp',
+        'chromecast_http_range.h',
         '../../demux/json/json.c',
         '../renderer_common.cpp',
         '../renderer_common.hpp') +
