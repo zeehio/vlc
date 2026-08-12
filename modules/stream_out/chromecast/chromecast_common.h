@@ -72,6 +72,19 @@ typedef struct
 
     void (*pf_set_input_length)(void*, vlc_tick_t length);
 
+    /**
+     * Report what the demux filter knows about the original source: its
+     * URL, the name of the demuxer that was actually selected for it (not
+     * the caller's requested hint), and whether it is seekable. Used to
+     * decide whether the source can be handed to the receiver as-is
+     * instead of going through the transcode/live-restream chain.
+     *
+     * \param psz_url NULL or empty clears the previously reported source.
+     * \param psz_demux NULL if unknown.
+     */
+    void (*pf_set_source_info)(void *, const char *psz_url, const char *psz_demux,
+                               bool b_can_seek);
+
 } chromecast_common;
 
 # ifdef __cplusplus

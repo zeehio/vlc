@@ -35,6 +35,8 @@
 #include "chromecast_common.h"
 
 #include <cassert>
+#include <cinttypes>
+#include <cstring>
 #include <new>
 
 static void on_paused_changed_cb(void *data, bool paused);
@@ -92,6 +94,37 @@ struct demux_cc
         if (demux_Control( p_demux->s, DEMUX_GET_LENGTH, &m_length ) != VLC_SUCCESS)
             m_length = -1;
         p_renderer->pf_set_input_length( p_renderer->p_opaque, m_length );
+
+        {
+            /* "module-name" holds the demuxer that was actually selected
+             * (e.g. "mp4", "mkv"), unlike the request that opened it, which
+             * is often just "any" for auto-detection.
+             *
+             * This "demux_filter" capability gets attached to every demux
+             * chain within the input, including slave sources such as an
+             * external subtitle file auto-detected as a slave - each gets
+             * its own demux_cc instance, all sharing the same intf_sys_t
+             * (found by climbing the same object tree), so a slave's own
+             * (text-only, and shorter/different-length) source would
+             * otherwise clobber the master A/V source's info. Skip
+             * reporting entirely from a text-only source. */
+            char *psz_real_demux = var_GetString( p_demux->s, "module-name" );
+            bool b_is_text_source = psz_real_demux != NULL
+                                   && !strcmp( psz_real_demux, "subtitle" );
+
+            input_item_t *p_item = p_demux->s->p_input_item;
+            char *psz_url = p_item ? input_item_GetURI( p_item ) : NULL;
+            msg_Dbg( p_demux, "cc source info: demux=%s can_seek=%d length=%" PRId64
+                    " url=%s%s", psz_real_demux ? psz_real_demux : "(null)",
+                    m_can_seek, (int64_t)m_length, psz_url ? psz_url : "(null)",
+                    b_is_text_source ? " (text-only source, not reporting)" : "" );
+
+            if( !b_is_text_source )
+                p_renderer->pf_set_source_info( p_renderer->p_opaque, psz_url,
+                                                psz_real_demux, m_can_seek );
+            free( psz_url );
+            free( psz_real_demux );
+        }
 
         int i_current_title;
         if( demux_Control( p_demux->s, DEMUX_GET_TITLE,

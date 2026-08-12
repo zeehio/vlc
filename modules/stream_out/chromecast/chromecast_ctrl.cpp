@@ -184,6 +184,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_httpd_file(NULL)
  , m_art_url(NULL)
  , m_art_idx(0)
+ , m_source_can_seek(false)
  , m_source_httpd_url(NULL)
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
@@ -214,6 +215,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_pause_state  = set_pause_state;
     m_common.pf_set_meta         = set_meta;
     m_common.pf_set_input_length = set_input_length;
+    m_common.pf_set_source_info  = set_source_info;
 
     m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
     if( m_source_httpd_url != NULL )
@@ -397,6 +399,33 @@ std::string intf_sys_t::getSourceMime() const
 {
     vlc::threads::mutex_locker lock( m_lock );
     return m_source_mime;
+}
+
+void intf_sys_t::setSourceInfo( const char *psz_url, const char *psz_demux, bool b_can_seek )
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    m_source_url = psz_url ? psz_url : "";
+    m_source_demux = psz_demux ? psz_demux : "";
+    m_source_can_seek = b_can_seek;
+}
+
+void intf_sys_t::set_source_info( void *data, const char *psz_url, const char *psz_demux,
+                                  bool b_can_seek )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setSourceInfo( psz_url, psz_demux, b_can_seek );
+}
+
+std::string intf_sys_t::getSourceDemux() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_source_demux;
+}
+
+bool intf_sys_t::getSourceCanSeek() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_source_can_seek;
 }
 
 int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,

@@ -196,6 +196,9 @@ struct intf_sys_t
     int httpd_file_fill( uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data );
     std::string getSourceUrl() const;
     std::string getSourceMime() const;
+    void setSourceInfo( const char *psz_url, const char *psz_demux, bool b_can_seek );
+    std::string getSourceDemux() const;
+    bool getSourceCanSeek() const;
     /**
      * Serve the original (untranscoded) source media bytes as-is over
      * HTTP, honoring Range requests. Nothing points a Cast session at this
@@ -255,6 +258,8 @@ private:
 
     static void set_meta(void*, vlc_meta_t *p_meta);
     static void set_input_length(void*, vlc_tick_t length);
+    static void set_source_info(void*, const char *psz_url, const char *psz_demux,
+                                bool b_can_seek);
 
     void prepareHttpArtwork();
 
@@ -318,6 +323,8 @@ private:
     unsigned          m_art_idx;
 
     std::string       m_source_url;
+    std::string       m_source_demux;
+    bool              m_source_can_seek;
     std::string       m_source_mime;
     struct SourceStreamClient;
     httpd_url_t                                    *m_source_httpd_url;
