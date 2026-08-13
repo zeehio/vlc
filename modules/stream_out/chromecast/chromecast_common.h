@@ -121,6 +121,22 @@ typedef struct
      */
     void (*pf_set_start_time)(void *, vlc_tick_t time);
 
+    /**
+     * Report how many audio tracks the master source has (embedded
+     * ones - read from the input item's es_vec, not slaves). Direct-serve
+     * hands the receiver the raw container bytes as-is with no way to
+     * tell it which embedded audio track to honour: the Default/Styled
+     * Media Receiver Cast apps only support selecting text tracks via
+     * the LOAD request's activeTrackIds, not audio or video (see
+     * https://developers.google.com/cast/docs/web_sender/advanced), so
+     * with more than one audio track the receiver would demux the file
+     * itself and pick whichever one it considers the default, which may
+     * not match what is actually selected locally. Used to fall back to
+     * the transcode/live-restream chain instead, which only ever
+     * encodes the one track actually selected.
+     */
+    void (*pf_set_audio_track_count)(void *, unsigned count);
+
 } chromecast_common;
 
 # ifdef __cplusplus

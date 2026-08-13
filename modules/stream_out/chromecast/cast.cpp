@@ -891,11 +891,24 @@ bool sout_stream_sys_t::canDirectServe( sout_stream_t *p_stream, bool canRemux )
     bool b_can_seek = p_intf->getSourceCanSeek();
     vlc_tick_t i_input_length = p_intf->getInputLength();
     bool b_url_ok = !p_intf->getSourceUrl().empty();
+    unsigned i_audio_tracks = p_intf->getAudioTrackCount();
+    /* Direct-serve hands the receiver the raw container bytes as-is,
+     * with no way to tell it which embedded audio track to honour:
+     * the Default/Styled Media Receiver Cast apps only support
+     * selecting text tracks via the LOAD request's activeTrackIds,
+     * not audio or video. With more than one audio track, the
+     * receiver would demux the file itself and pick whichever one it
+     * considers the default, which may not match what is actually
+     * selected locally - fall back to the transcode/live-restream
+     * chain instead, which only ever encodes the one track actually
+     * selected. */
+    bool b_single_audio_track = i_audio_tracks <= 1;
     msg_Dbg( p_stream, "direct-serve check: canRemux=1 demux=\"%s\" container_ok=%d "
-            "can_seek=%d length=%" PRId64 " url_ok=%d",
+            "can_seek=%d length=%" PRId64 " url_ok=%d audio_tracks=%u",
             source_demux.c_str(), b_container_ok, b_can_seek,
-            (int64_t)i_input_length, b_url_ok );
-    return b_container_ok && b_can_seek && i_input_length > 0 && b_url_ok;
+            (int64_t)i_input_length, b_url_ok, i_audio_tracks );
+    return b_container_ok && b_can_seek && i_input_length > 0 && b_url_ok
+        && b_single_audio_track;
 }
 
 void sout_stream_sys_t::stopSoutChain(sout_stream_t *p_stream)

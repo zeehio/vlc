@@ -124,6 +124,29 @@ struct demux_cc
                 p_renderer->pf_set_source_info( p_renderer->p_opaque, psz_url,
                                                 psz_real_demux, m_can_seek );
 
+                {
+                    /* Counted from the input item's own ES list (populated
+                     * for every discovered track, selected or not - unlike
+                     * the sout, which only ever sees the one currently
+                     * selected). See chromecast_common.h's
+                     * pf_set_audio_track_count for why direct-serve
+                     * eligibility needs this. */
+                    unsigned i_audio_tracks = 0;
+                    if( p_item )
+                    {
+                        vlc_mutex_lock( &p_item->lock );
+                        for( size_t i = 0; i < p_item->es_vec.size; ++i )
+                        {
+                            if( p_item->es_vec.data[i].es.i_cat == AUDIO_ES )
+                                i_audio_tracks++;
+                        }
+                        vlc_mutex_unlock( &p_item->lock );
+                    }
+                    msg_Dbg( p_demux, "cc source info: audio_tracks=%u", i_audio_tracks );
+                    p_renderer->pf_set_audio_track_count( p_renderer->p_opaque,
+                                                          i_audio_tracks );
+                }
+
                 /* Wherever local playback already is when casting starts
                  * (e.g. the user was already partway through the file):
                  * Direct-serve points the receiver at the source's own absolute

@@ -203,6 +203,8 @@ struct intf_sys_t
     std::string getSourceDemux() const;
     bool getSourceCanSeek() const;
     vlc_tick_t getInputLength() const;
+    void setAudioTrackCount( unsigned count );
+    unsigned getAudioTrackCount() const;
     void setStartTime( vlc_tick_t time );
     vlc_tick_t getStartTime() const;
 
@@ -287,6 +289,7 @@ private:
     static void set_input_length(void*, vlc_tick_t length);
     static void set_source_info(void*, const char *psz_url, const char *psz_demux,
                                 bool b_can_seek);
+    static void set_audio_track_count(void*, unsigned count);
     static bool is_source_direct(void*);
     static bool seek_source(void*, vlc_tick_t time);
     static bool is_eligibility_decided(void*);
@@ -356,6 +359,7 @@ private:
     std::string       m_source_url;
     std::string       m_source_demux;
     bool              m_source_can_seek;
+    unsigned          m_audio_track_count;
     std::string       m_source_mime;
     bool              m_source_direct;
     bool              m_eligibility_decided;

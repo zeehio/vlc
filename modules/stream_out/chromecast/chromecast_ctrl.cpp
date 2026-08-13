@@ -185,6 +185,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_art_url(NULL)
  , m_art_idx(0)
  , m_source_can_seek(false)
+ , m_audio_track_count(0)
  , m_source_direct(false)
  , m_eligibility_decided(false)
  , m_source_httpd_url(NULL)
@@ -219,6 +220,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_meta         = set_meta;
     m_common.pf_set_input_length = set_input_length;
     m_common.pf_set_source_info  = set_source_info;
+    m_common.pf_set_audio_track_count = set_audio_track_count;
     m_common.pf_is_source_direct = is_source_direct;
     m_common.pf_seek             = seek_source;
     m_common.pf_is_eligibility_decided = is_eligibility_decided;
@@ -421,6 +423,24 @@ void intf_sys_t::set_source_info( void *data, const char *psz_url, const char *p
 {
     intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
     p_sys->setSourceInfo( psz_url, psz_demux, b_can_seek );
+}
+
+void intf_sys_t::setAudioTrackCount( unsigned count )
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    m_audio_track_count = count;
+}
+
+void intf_sys_t::set_audio_track_count( void *data, unsigned count )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setAudioTrackCount( count );
+}
+
+unsigned intf_sys_t::getAudioTrackCount() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_audio_track_count;
 }
 
 std::string intf_sys_t::getSourceDemux() const
