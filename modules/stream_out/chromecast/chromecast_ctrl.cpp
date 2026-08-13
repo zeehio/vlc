@@ -589,6 +589,15 @@ void intf_sys_t::set_subtitle( void *data, char *psz_webvtt )
  */
 void intf_sys_t::requestReload()
 {
+    /* Snapshot the current position before the reset below forgets it:
+     * direct-serve's contentId points at the same whole file on every
+     * LOAD, so a reload without a currentTime restarts it from position
+     * 0 - unlike live-restream, whose freshly re-cast stream already
+     * only contains data from here onwards and so doesn't need this.
+     * getPlaybackTimestamp() takes m_lock itself, so this must happen
+     * before locking it below. */
+    vlc_tick_t reload_time = getPlaybackTimestamp();
+
     vlc::threads::mutex_locker locker( m_lock );
 
     if( m_state == Dead || m_mime.empty() )
@@ -607,6 +616,8 @@ void intf_sys_t::requestReload()
     m_cc_time_date = VLC_TICK_INVALID;
     m_cc_time = VLC_TICK_INVALID;
     m_mediaSessionId = 0;
+    if( m_source_direct && reload_time != VLC_TICK_INVALID )
+        m_start_time = reload_time;
 
     tryLoad();
 
