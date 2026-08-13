@@ -161,6 +161,37 @@ typedef struct
      */
     void (*pf_reload)(void *);
 
+    /**
+     * Report that an external subtitle slave's own text track was just
+     * explicitly selected. The input core routes DEMUX_SET_ES /
+     * DEMUX_SET_ES_LIST only to the specific source that owns the
+     * newly-selected track (see ControlSetEsList/INPUT_CONTROL_SET_ES in
+     * src/input/input.c), so a slave's own demux filter instance seeing
+     * one of these calls is a precise "my track was just selected"
+     * signal. Reported here so the master's subtitle sidecar scan (the
+     * only instance with the local playback position the live-restream
+     * offset needs) can honour it instead of always defaulting to the
+     * first external slave found.
+     *
+     * \param psz_uri the slave's own URI ("" clears the override,
+     *                falling back to the first external slave found).
+     */
+    void (*pf_set_selected_subtitle_uri)(void *, const char *psz_uri);
+
+    /**
+     * Test-and-clear: true (once) exactly when pf_set_selected_subtitle_uri
+     * was called since the last call to this function, meaning the
+     * sidecar scan should be re-run to honour the new selection.
+     */
+    bool (*pf_consume_subtitle_selection_change)(void *);
+
+    /**
+     * Return the URI last reported via pf_set_selected_subtitle_uri
+     * (heap-allocated, caller must free()); NULL if none has been
+     * reported yet.
+     */
+    char *(*pf_get_selected_subtitle_uri)(void *);
+
 } chromecast_common;
 
 # ifdef __cplusplus

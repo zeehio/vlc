@@ -249,6 +249,15 @@ struct intf_sys_t
     void requestReload();
     int httpd_subtitle_cb( httpd_client_t *cl, httpd_message_t *answer,
                            const httpd_message_t *query );
+
+    /**
+     * See chromecast_common.h's pf_set_selected_subtitle_uri,
+     * pf_consume_subtitle_selection_change and
+     * pf_get_selected_subtitle_uri.
+     */
+    void setSelectedSubtitleUri( const char *psz_uri );
+    bool consumeSubtitleSelectionChange();
+    std::string getSelectedSubtitleUri() const;
     void interrupt_wake_up();
     void preservePlaybackOnTeardown();
 private:
@@ -307,6 +316,9 @@ private:
     static void set_start_time(void*, vlc_tick_t time);
     static void set_subtitle(void*, char *psz_webvtt);
     static void reload(void*);
+    static void set_selected_subtitle_uri(void*, const char *psz_uri);
+    static bool consume_subtitle_selection_change(void*);
+    static char *get_selected_subtitle_uri(void*);
 
     void prepareHttpArtwork();
 
@@ -382,6 +394,8 @@ private:
     vlc_tick_t        m_start_time;
     httpd_url_t      *m_subtitle_url;
     char             *m_subtitle_webvtt;
+    std::string       m_selected_subtitle_uri;
+    bool              m_selected_subtitle_uri_changed;
 
     vlc_tick_t        m_cc_time_last_request_date;
     vlc_tick_t        m_cc_time_date;

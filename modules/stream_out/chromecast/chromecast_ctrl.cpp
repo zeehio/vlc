@@ -195,6 +195,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_start_time( VLC_TICK_INVALID )
  , m_subtitle_url(NULL)
  , m_subtitle_webvtt(NULL)
+ , m_selected_subtitle_uri_changed(false)
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
  , m_pingRetriesLeft( PING_WAIT_RETRIES )
@@ -232,6 +233,9 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_start_time   = set_start_time;
     m_common.pf_set_subtitle     = set_subtitle;
     m_common.pf_reload           = reload;
+    m_common.pf_set_selected_subtitle_uri = set_selected_subtitle_uri;
+    m_common.pf_consume_subtitle_selection_change = consume_subtitle_selection_change;
+    m_common.pf_get_selected_subtitle_uri = get_selected_subtitle_uri;
 
     m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
     if( m_source_httpd_url != NULL )
@@ -613,6 +617,46 @@ void intf_sys_t::reload( void *data )
 {
     intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
     p_sys->requestReload();
+}
+
+void intf_sys_t::setSelectedSubtitleUri( const char *psz_uri )
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    m_selected_subtitle_uri = psz_uri ? psz_uri : "";
+    m_selected_subtitle_uri_changed = true;
+}
+
+void intf_sys_t::set_selected_subtitle_uri( void *data, const char *psz_uri )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setSelectedSubtitleUri( psz_uri );
+}
+
+bool intf_sys_t::consumeSubtitleSelectionChange()
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    bool b_changed = m_selected_subtitle_uri_changed;
+    m_selected_subtitle_uri_changed = false;
+    return b_changed;
+}
+
+bool intf_sys_t::consume_subtitle_selection_change( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    return p_sys->consumeSubtitleSelectionChange();
+}
+
+std::string intf_sys_t::getSelectedSubtitleUri() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_selected_subtitle_uri;
+}
+
+char *intf_sys_t::get_selected_subtitle_uri( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    std::string uri = p_sys->getSelectedSubtitleUri();
+    return uri.empty() ? NULL : strdup( uri.c_str() );
 }
 
 int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,

@@ -50,6 +50,7 @@ struct demux_cc
         :p_demux(demux)
         ,p_renderer(renderer)
         ,m_enabled( true )
+        ,m_is_subtitle_source( false )
         ,m_subtitle_scanned( false )
         ,m_subtitle_loaded_once( false )
         ,m_subtitle_has_content( false )
@@ -118,6 +119,7 @@ struct demux_cc
             char *psz_real_demux = var_GetString( p_demux->s, "module-name" );
             bool b_is_text_source = psz_real_demux != NULL
                                    && !strcmp( psz_real_demux, "subtitle" );
+            m_is_subtitle_source = b_is_text_source;
 
             input_item_t *p_item = p_demux->s->p_input_item;
             char *psz_url = p_item ? input_item_GetURI( p_item ) : NULL;
@@ -279,7 +281,23 @@ struct demux_cc
         std::string uri;
         input_item_t *p_item = p_demux->s->p_input_item;
         msg_Dbg( p_demux, "cc subtitle scan: p_item=%p", (void*)p_item );
-        if( p_item )
+
+        /* Prefer whichever external subtitle slave was last explicitly
+         * selected (see chromecast_common.h's pf_set_selected_subtitle_uri):
+         * each external subtitle file is its own input source with its own
+         * demux filter instance, which reports itself here the moment its
+         * own track gets selected. Falling back to "the first external
+         * slave found" below only applies before any selection has ever
+         * been reported, e.g. right after casting starts with a subtitle
+         * already showing by default. */
+        char *psz_selected =
+            p_renderer->pf_get_selected_subtitle_uri( p_renderer->p_opaque );
+        if( psz_selected != NULL )
+        {
+            uri = psz_selected;
+            free( psz_selected );
+        }
+        else if( p_item )
         {
             vlc_mutex_lock( &p_item->lock );
             msg_Dbg( p_demux, "cc subtitle scan: i_slaves=%d", p_item->i_slaves );
@@ -468,31 +486,43 @@ struct demux_cc
         if ( !m_enabled )
             return demux_Demux( p_demux->s );
 
-        if( !m_subtitle_scanned )
+        /* Only the master runs the sidecar scan: it alone has the local
+         * playback position the live-restream offset needs (see
+         * setSubtitleFromSlaves()); an external subtitle slave's own
+         * instance only ever reports itself via
+         * pf_set_selected_subtitle_uri (see the DEMUX_SET_ES/
+         * DEMUX_SET_ES_LIST handling in Control() below). */
+        if( !m_is_subtitle_source )
         {
-            /* Wait for direct-serve eligibility to be settled for the
-             * (now-fully-known) track set before the one-time scan,
-             * instead of scanning immediately and correcting later: a
-             * "scan now (possibly with the wrong offset), fix on the next
-             * call" approach means the receiver may fetch and start
-             * rendering a first, necessarily-wrong version of the sidecar
-             * before the corrected one replaces it - and there is no
-             * guarantee a reload actually clears cues already rendered
-             * from that first fetch, rather than layering the corrected
-             * ones on top of them. */
-            if( p_renderer->pf_is_eligibility_decided( p_renderer->p_opaque ) )
+            if( !m_subtitle_scanned )
             {
-                m_subtitle_scanned = true;
+                /* Wait for direct-serve eligibility to be settled for the
+                 * (now-fully-known) track set before the one-time scan,
+                 * instead of scanning immediately and correcting later: a
+                 * "scan now (possibly with the wrong offset), fix on the next
+                 * call" approach means the receiver may fetch and start
+                 * rendering a first, necessarily-wrong version of the sidecar
+                 * before the corrected one replaces it - and there is no
+                 * guarantee a reload actually clears cues already rendered
+                 * from that first fetch, rather than layering the corrected
+                 * ones on top of them. */
+                if( p_renderer->pf_is_eligibility_decided( p_renderer->p_opaque ) )
+                {
+                    m_subtitle_scanned = true;
+                    setSubtitleFromSlaves();
+                }
+            }
+            else if( p_renderer->pf_consume_subtitle_selection_change( p_renderer->p_opaque )
+                  || ( m_subtitle_has_content
+                    && m_subtitle_scan_was_direct_serve != p_renderer->pf_is_source_direct( p_renderer->p_opaque ) ) )
+            {
+                /* Either a different external subtitle slave was just
+                 * explicitly selected, or direct-serve status changed since
+                 * the scan (e.g. a track change flipped eligibility
+                 * mid-session): regenerate the sidecar with the correct
+                 * content/reference frame and reload the receiver. */
                 setSubtitleFromSlaves();
             }
-        }
-        else if( m_subtitle_has_content
-              && m_subtitle_scan_was_direct_serve != p_renderer->pf_is_source_direct( p_renderer->p_opaque ) )
-        {
-            /* Direct-serve status changed since the scan (e.g. a track change
-             * flipped eligibility mid-session): regenerate the sidecar
-             * with the correct reference frame and reload the receiver. */
-            setSubtitleFromSlaves();
         }
 
         /* The CC sout is not pacing, so we pace here */
@@ -676,7 +706,22 @@ struct demux_cc
             seekBack(m_last_time, m_last_pos);
             resetTimes();
             resetDemuxEof();
-            m_subtitle_scanned = false;
+
+            if( m_is_subtitle_source )
+            {
+                /* The input core routes DEMUX_SET_ES/DEMUX_SET_ES_LIST only
+                 * to the source that owns the newly-selected track (see
+                 * ControlSetEsList/INPUT_CONTROL_SET_ES in
+                 * src/input/input.c), so this filter instance receiving one
+                 * at all means its own external subtitle file was just
+                 * selected. Report it so the master's scan (below) picks
+                 * this one instead of always defaulting to the first
+                 * external slave found. */
+                p_renderer->pf_set_selected_subtitle_uri( p_renderer->p_opaque,
+                                                          p_demux->s->psz_url );
+            }
+            else
+                m_subtitle_scanned = false;
             break;
         case DEMUX_FILTER_ENABLE:
             p_renderer = static_cast<chromecast_common *>(
@@ -710,6 +755,7 @@ protected:
     vlc_tick_t    m_length;
     bool          m_can_seek;
     bool          m_enabled;
+    bool          m_is_subtitle_source;
     bool          m_subtitle_scanned;
     bool          m_subtitle_loaded_once;
     bool          m_subtitle_has_content;
