@@ -124,6 +124,7 @@ struct sout_stream_sys_t
     bool canDecodeVideo( const es_format_t * ) const;
     bool canDecodeAudio( sout_stream_t* p_stream, vlc_fourcc_t i_codec,
                          const audio_format_t* p_fmt ) const;
+    bool canDirectServe( sout_stream_t *p_stream, bool canRemux ) const;
     bool startSoutChain(sout_stream_t* p_stream,
                         const std::vector<sout_stream_id_sys_t*> &new_streams,
                         const std::string &sout, int new_transcoding_state);
@@ -868,6 +869,35 @@ bool sout_stream_sys_t::canDecodeAudio( sout_stream_t *p_stream,
     }
 }
 
+/**
+ * Direct-serve eligibility: whether the source can be handed to the
+ * receiver as its own bytes (see intf_sys_t::setSourceDirect) instead of
+ * being transcoded/remuxed into a live restream. canRemux (a codec the
+ * receiver can decode natively, and no embedded subtitle track selected)
+ * is necessary but not sufficient: it also has to be a finite, seekable
+ * file in a container the receiver can index itself, with a URL to
+ * actually serve.
+ */
+bool sout_stream_sys_t::canDirectServe( sout_stream_t *p_stream, bool canRemux ) const
+{
+    if ( !canRemux )
+    {
+        msg_Dbg( p_stream, "direct-serve check: canRemux=0, skipping" );
+        return false;
+    }
+
+    std::string source_demux = p_intf->getSourceDemux();
+    bool b_container_ok = ( source_demux == "mp4" || source_demux == "mkv" );
+    bool b_can_seek = p_intf->getSourceCanSeek();
+    vlc_tick_t i_input_length = p_intf->getInputLength();
+    bool b_url_ok = !p_intf->getSourceUrl().empty();
+    msg_Dbg( p_stream, "direct-serve check: canRemux=1 demux=\"%s\" container_ok=%d "
+            "can_seek=%d length=%" PRId64 " url_ok=%d",
+            source_demux.c_str(), b_container_ok, b_can_seek,
+            (int64_t)i_input_length, b_url_ok );
+    return b_container_ok && b_can_seek && i_input_length > 0 && b_url_ok;
+}
+
 void sout_stream_sys_t::stopSoutChain(sout_stream_t *p_stream)
 {
     (void) p_stream;
@@ -1112,34 +1142,21 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
 
     bool b_direct_serve = false;
     std::string direct_serve_mime;
-    if ( canRemux )
+    if ( canDirectServe( p_stream, canRemux ) )
     {
         std::string source_demux = p_intf->getSourceDemux();
-        bool b_container_ok = ( source_demux == "mp4" || source_demux == "mkv" );
-        bool b_can_seek = p_intf->getSourceCanSeek();
-        vlc_tick_t i_input_length = p_intf->getInputLength();
-        bool b_url_ok = !p_intf->getSourceUrl().empty();
-        msg_Dbg( p_stream, "direct-serve check: canRemux=1 demux=\"%s\" container_ok=%d "
-                "can_seek=%d length=%" PRId64 " url_ok=%d",
-                source_demux.c_str(), b_container_ok, b_can_seek,
-                (int64_t)i_input_length, b_url_ok );
-        if ( b_container_ok && b_can_seek && i_input_length > 0 && b_url_ok )
-        {
-            const bool b_source_webm = ( i_codec_audio == VLC_CODEC_VORBIS ||
-                                        i_codec_audio == VLC_CODEC_OPUS ) &&
-                                       ( i_codec_video == VLC_CODEC_VP8 ||
-                                        i_codec_video == VLC_CODEC_VP9 );
-            b_direct_serve = true;
-            if ( source_demux == "mp4" )
-                direct_serve_mime = p_original_video ? "video/mp4" : "audio/mp4";
-            else
-                direct_serve_mime = b_source_webm
-                    ? ( p_original_video ? "video/webm" : "audio/webm" )
-                    : ( p_original_video ? "video/x-matroska" : "audio/x-matroska" );
-        }
+        const bool b_source_webm = ( i_codec_audio == VLC_CODEC_VORBIS ||
+                                    i_codec_audio == VLC_CODEC_OPUS ) &&
+                                   ( i_codec_video == VLC_CODEC_VP8 ||
+                                    i_codec_video == VLC_CODEC_VP9 );
+        b_direct_serve = true;
+        if ( source_demux == "mp4" )
+            direct_serve_mime = p_original_video ? "video/mp4" : "audio/mp4";
+        else
+            direct_serve_mime = b_source_webm
+                ? ( p_original_video ? "video/webm" : "audio/webm" )
+                : ( p_original_video ? "video/x-matroska" : "audio/x-matroska" );
     }
-    else
-        msg_Dbg( p_stream, "direct-serve check: canRemux=0, skipping" );
 
     if ( b_direct_serve )
     {
