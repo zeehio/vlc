@@ -195,6 +195,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_start_time( VLC_TICK_INVALID )
  , m_subtitle_url(NULL)
  , m_subtitle_webvtt(NULL)
+ , m_selected_subtitle_track(-1)
  , m_selected_subtitle_uri_changed(false)
  , m_cc_time_date( VLC_TICK_INVALID )
  , m_cc_time( VLC_TICK_INVALID )
@@ -236,6 +237,8 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
     m_common.pf_set_selected_subtitle_uri = set_selected_subtitle_uri;
     m_common.pf_consume_subtitle_selection_change = consume_subtitle_selection_change;
     m_common.pf_get_selected_subtitle_uri = get_selected_subtitle_uri;
+    m_common.pf_set_selected_subtitle_track = set_selected_subtitle_track;
+    m_common.pf_get_selected_subtitle_track = get_selected_subtitle_track;
 
     m_source_httpd_url = httpd_UrlNew( m_httpd.m_host, getHttpSourcePath().c_str(), NULL, NULL );
     if( m_source_httpd_url != NULL )
@@ -634,6 +637,11 @@ void intf_sys_t::setSelectedSubtitleUri( const char *psz_uri )
 {
     vlc::threads::mutex_locker lock( m_lock );
     m_selected_subtitle_uri = psz_uri ? psz_uri : "";
+    /* Only one subtitle can really be showing at a time - an external
+     * slave being explicitly selected supersedes whatever embedded track
+     * was selected before it. */
+    if( !m_selected_subtitle_uri.empty() )
+        m_selected_subtitle_track = -1;
     m_selected_subtitle_uri_changed = true;
 }
 
@@ -668,6 +676,36 @@ char *intf_sys_t::get_selected_subtitle_uri( void *data )
     intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
     std::string uri = p_sys->getSelectedSubtitleUri();
     return uri.empty() ? NULL : strdup( uri.c_str() );
+}
+
+void intf_sys_t::setSelectedSubtitleTrack( int i_track_id )
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    m_selected_subtitle_track = i_track_id;
+    /* Mirrors setSelectedSubtitleUri(): an embedded track being
+     * explicitly selected supersedes whatever external slave was
+     * selected before it. */
+    if( i_track_id >= 0 )
+        m_selected_subtitle_uri.clear();
+    m_selected_subtitle_uri_changed = true;
+}
+
+void intf_sys_t::set_selected_subtitle_track( void *data, int i_track_id )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    p_sys->setSelectedSubtitleTrack( i_track_id );
+}
+
+int intf_sys_t::getSelectedSubtitleTrack() const
+{
+    vlc::threads::mutex_locker lock( m_lock );
+    return m_selected_subtitle_track;
+}
+
+int intf_sys_t::get_selected_subtitle_track( void *data )
+{
+    intf_sys_t *p_sys = static_cast<intf_sys_t*>(data);
+    return p_sys->getSelectedSubtitleTrack();
 }
 
 int intf_sys_t::httpd_source_cb( httpd_client_t *cl, httpd_message_t *answer,

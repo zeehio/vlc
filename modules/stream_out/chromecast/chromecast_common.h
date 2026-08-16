@@ -173,6 +173,10 @@ typedef struct
      * offset needs) can honour it instead of always defaulting to the
      * first external slave found.
      *
+     * A non-empty URI also supersedes any embedded track previously
+     * reported via pf_set_selected_subtitle_track below - only one
+     * subtitle can really be showing at a time.
+     *
      * \param psz_uri the slave's own URI ("" clears the override,
      *                falling back to the first external slave found).
      */
@@ -180,8 +184,9 @@ typedef struct
 
     /**
      * Test-and-clear: true (once) exactly when pf_set_selected_subtitle_uri
-     * was called since the last call to this function, meaning the
-     * sidecar scan should be re-run to honour the new selection.
+     * or pf_set_selected_subtitle_track was called since the last call to
+     * this function, meaning the sidecar scan should be re-run to honour
+     * the new selection.
      */
     bool (*pf_consume_subtitle_selection_change)(void *);
 
@@ -191,6 +196,37 @@ typedef struct
      * reported yet.
      */
     char *(*pf_get_selected_subtitle_uri)(void *);
+
+    /**
+     * Report that an embedded (in-container) subtitle track on the
+     * master source was just explicitly selected, so the sidecar scan
+     * can hand its content over as a WebVTT sidecar the same way it does
+     * for an external slave (see chromecast_webvtt.h's
+     * chromecast_ConvertEmbeddedTrackToWebVTT). Unlike an external
+     * slave, an embedded track has no URI of its own: it is identified
+     * by the id its own demuxer gave it (es_format_t::i_id), which a
+     * second, independent pass over the same source matches against to
+     * single it out. Reuses pf_consume_subtitle_selection_change - from
+     * the sidecar scan's point of view, "an external slave got selected"
+     * and "an embedded track got selected" both just mean "reconsider
+     * what to show".
+     *
+     * A track id >= 0 also supersedes any external slave URI previously
+     * reported via pf_set_selected_subtitle_uri above - only one
+     * subtitle can really be showing at a time.
+     *
+     * \param i_track_id the container-assigned track id, or -1 to clear
+     *                    the override (falls back to whatever else
+     *                    applies, e.g. an external slave).
+     */
+    void (*pf_set_selected_subtitle_track)(void *, int i_track_id);
+
+    /**
+     * Return the track id last reported via
+     * pf_set_selected_subtitle_track, or -1 if none has been reported
+     * yet (or it was cleared).
+     */
+    int (*pf_get_selected_subtitle_track)(void *);
 
 } chromecast_common;
 
