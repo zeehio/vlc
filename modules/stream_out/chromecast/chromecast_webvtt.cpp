@@ -34,6 +34,8 @@
 #include <vlc_modules.h>
 #include <vlc_block.h>
 
+#include <vector>
+
 namespace {
 
 /* ---- decoder: owns a decoder_t and collects every subpicture it queues,
@@ -78,22 +80,55 @@ void DeleteSubtitleDecoder( SubtitleDecoder *sys )
     decoder_Destroy( &sys->dec ); /* frees the SubtitleDecoder block itself */
 }
 
-/* ---- minimal es_out_t: hands every SPU_ES block to the decoder above as
- * soon as the demuxer sends it (no fifo/threading needed: pf_decode is a
- * synchronous call for spu decoders). Only the first SPU track found is
- * used - a sidecar track needs one text stream, and subtitle files don't
- * carry more than one anyway. ---- */
+/* ---- minimal es_out_t: hands every SPU_ES block from the target track to
+ * the decoder above as soon as the demuxer sends it (no fifo/threading
+ * needed: pf_decode is a synchronous call for spu decoders).
+ *
+ * Two modes, selected by i_track_id:
+ *  - external-file mode (i_track_id < 0): the demuxer behind this es_out
+ *    is always the generic "subtitle" module, which only ever has one ES,
+ *    so the first (and only) SPU track found is it. Every other track
+ *    (there is none in practice) is rejected outright.
+ *  - embedded-track mode (i_track_id >= 0): the demuxer behind this
+ *    es_out is a real container demuxer with several tracks of every
+ *    kind. Only the SPU track whose container-assigned id matches is
+ *    decoded, but every track still needs Add() to return a valid,
+ *    distinct id: container demuxers track each one's selection state by
+ *    id (see e.g. MP4_TrackSelect()/DemuxTrack() in
+ *    modules/demux/mp4/mp4.c) and poll it back via ES_OUT_GET_ES_STATE
+ *    before reading its samples, skipping (seeking over, not reading)
+ *    those reported unselected - which is exactly how real playback
+ *    already avoids decoding tracks nobody asked for. Answering that
+ *    query honestly for every id here is what makes this pass over the
+ *    file cheap, and it is a plain property of the es_out_t contract any
+ *    conformant demuxer already relies on, not something specific to any
+ *    one container. ---- */
 struct SubtitleEsOut
 {
     es_out_t out;
     vlc_object_t *p_parent;
     SubtitleDecoder *decoder;
+    es_out_id_t *target_id;
+    int i_track_id;
+    std::vector<void *> placeholders;
 
     static es_out_id_t *Add( es_out_t *out, input_source_t *, const es_format_t *fmt )
     {
         SubtitleEsOut *sys = container_of( out, SubtitleEsOut, out );
-        if( fmt->i_cat != SPU_ES || sys->decoder != nullptr )
-            return nullptr;
+
+        bool b_want = sys->decoder == nullptr && fmt->i_cat == SPU_ES
+                    && ( sys->i_track_id < 0 || fmt->i_id == sys->i_track_id );
+        if( !b_want )
+        {
+            if( sys->i_track_id < 0 )
+                return nullptr;
+
+            void *placeholder = malloc( 1 );
+            if( unlikely( placeholder == nullptr ) )
+                return nullptr;
+            sys->placeholders.push_back( placeholder );
+            return static_cast<es_out_id_t *>( placeholder );
+        }
 
         SubtitleDecoder *dec = vlc_object_create<SubtitleDecoder>( sys->p_parent );
         if( unlikely( dec == nullptr ) )
@@ -119,13 +154,14 @@ struct SubtitleEsOut
         }
 
         sys->decoder = dec;
-        return reinterpret_cast<es_out_id_t *>( dec );
+        sys->target_id = reinterpret_cast<es_out_id_t *>( dec );
+        return sys->target_id;
     }
 
     static int Send( es_out_t *out, es_out_id_t *id, block_t *block )
     {
         SubtitleEsOut *sys = container_of( out, SubtitleEsOut, out );
-        if( reinterpret_cast<SubtitleDecoder *>( id ) != sys->decoder
+        if( sys->decoder == nullptr || id != sys->target_id
          || sys->decoder->dec.pf_decode == nullptr )
         {
             block_Release( block );
@@ -136,7 +172,20 @@ struct SubtitleEsOut
     }
 
     static void Del( es_out_t *, es_out_id_t * ) {}
-    static int Control( es_out_t *, input_source_t *, int, va_list ) { return VLC_EGENERIC; }
+
+    static int Control( es_out_t *out, input_source_t *, int query, va_list args )
+    {
+        if( query == ES_OUT_GET_ES_STATE )
+        {
+            SubtitleEsOut *sys = container_of( out, SubtitleEsOut, out );
+            es_out_id_t *id = va_arg( args, es_out_id_t * );
+            bool *pb_selected = va_arg( args, bool * );
+            *pb_selected = ( id == sys->target_id );
+            return VLC_SUCCESS;
+        }
+        return VLC_EGENERIC;
+    }
+
     static void Destroy( es_out_t * ) {}
 };
 
@@ -186,44 +235,19 @@ struct MemorySink
     }
 };
 
-} // namespace
-
-char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
-                                              const char *psz_uri,
-                                              vlc_tick_t i_offset )
+/**
+ * Shared tail for both public entry points below: once a demux pass is
+ * done, an external subtitle file and an embedded track look identical -
+ * a decoder that collected zero or more subpictures, plus a segment
+ * offset. Always takes ownership of *p_decoder (destroys it, even on
+ * failure); p_decoder may be NULL (no matching track was found).
+ */
+char *EncodeToWebVTT( vlc_object_t *p_parent, SubtitleDecoder *p_decoder,
+                      vlc_tick_t i_offset, const char *psz_log_id )
 {
-    stream_t *s = vlc_stream_NewURL( p_parent, psz_uri );
-    if( s == nullptr )
+    if( p_decoder == nullptr )
     {
-        msg_Warn( p_parent, "cc subtitle convert: vlc_stream_NewURL failed for %s", psz_uri );
-        return nullptr;
-    }
-
-    /* demux/subtitle.c inherits this var from input_thread_t normally (see
-     * src/input/var.c: "Inherited by demux/subtitle.c"); we're not running
-     * under one, so create it ourselves - otherwise it asserts. */
-    var_Create( p_parent, "sub-original-fps", VLC_VAR_FLOAT );
-
-    SubtitleEsOut es_out = { { &es_out_cbs }, p_parent, nullptr };
-    demux_t *demux = demux_New( p_parent, "subtitle", psz_uri, s, &es_out.out );
-    if( demux == nullptr )
-    {
-        msg_Dbg( p_parent, "cc subtitle convert: %s is not a subtitle file VLC recognizes",
-                psz_uri );
-        vlc_stream_Delete( s );
-        return nullptr;
-    }
-
-    int ret;
-    do
-        ret = demux_Demux( demux );
-    while( ret == VLC_DEMUXER_SUCCESS );
-
-    demux_Delete( demux ); /* also deletes s */
-
-    if( es_out.decoder == nullptr )
-    {
-        msg_Dbg( p_parent, "cc subtitle convert: no subtitle track found in %s", psz_uri );
+        msg_Dbg( p_parent, "cc subtitle convert: no subtitle track found in %s", psz_log_id );
         return nullptr;
     }
 
@@ -241,10 +265,10 @@ char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
     encoder_t *enc = sout_EncoderCreate( p_parent, sizeof( *enc ) );
     if( unlikely( enc == nullptr ) )
     {
-        DeleteSubtitleDecoder( es_out.decoder );
+        DeleteSubtitleDecoder( p_decoder );
         return nullptr;
     }
-    es_format_Init( &enc->fmt_in, SPU_ES, es_out.decoder->fmt_in.i_codec );
+    es_format_Init( &enc->fmt_in, SPU_ES, p_decoder->fmt_in.i_codec );
     es_format_Init( &enc->fmt_out, SPU_ES, VLC_CODEC_WEBVTT );
     enc->p_cfg = nullptr;
     /* No shortcut name: exactly one "spu encoder" module claims
@@ -256,7 +280,7 @@ char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
         es_format_Clean( &enc->fmt_in );
         es_format_Clean( &enc->fmt_out );
         vlc_object_delete( enc );
-        DeleteSubtitleDecoder( es_out.decoder );
+        DeleteSubtitleDecoder( p_decoder );
         return nullptr;
     }
 
@@ -289,7 +313,7 @@ char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
     unsigned n_cues = 0;
     if( mux_input != nullptr )
     {
-        for( subpicture_t *sp = es_out.decoder->spu_first; sp != nullptr; sp = sp->p_next )
+        for( subpicture_t *sp = p_decoder->spu_first; sp != nullptr; sp = sp->p_next )
         {
             subpicture_Update( sp, &canvas, &canvas, canvas.i_width, canvas.i_height,
                                sp->i_start );
@@ -320,7 +344,7 @@ char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
     }
 
     msg_Dbg( p_parent, "cc subtitle convert: %s -> %u WebVTT cue(s) for this segment",
-            psz_uri, n_cues );
+            psz_log_id, n_cues );
 
     if( mux_input != nullptr )
         sout_MuxDeleteStream( mux, mux_input );
@@ -332,7 +356,7 @@ char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
         vlc_object_delete( access );
     }
     vlc_encoder_Destroy( enc );
-    DeleteSubtitleDecoder( es_out.decoder );
+    DeleteSubtitleDecoder( p_decoder );
 
     if( n_cues == 0 )
     {
@@ -350,4 +374,84 @@ char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
     }
     out[sink.len] = '\0';
     return out;
+}
+
+} // namespace
+
+char *chromecast_ConvertSubtitleFileToWebVTT( vlc_object_t *p_parent,
+                                              const char *psz_uri,
+                                              vlc_tick_t i_offset )
+{
+    stream_t *s = vlc_stream_NewURL( p_parent, psz_uri );
+    if( s == nullptr )
+    {
+        msg_Warn( p_parent, "cc subtitle convert: vlc_stream_NewURL failed for %s", psz_uri );
+        return nullptr;
+    }
+
+    /* demux/subtitle.c inherits this var from input_thread_t normally (see
+     * src/input/var.c: "Inherited by demux/subtitle.c"); we're not running
+     * under one, so create it ourselves - otherwise it asserts. */
+    var_Create( p_parent, "sub-original-fps", VLC_VAR_FLOAT );
+
+    SubtitleEsOut es_out = { { &es_out_cbs }, p_parent, nullptr, nullptr, -1, {} };
+    demux_t *demux = demux_New( p_parent, "subtitle", psz_uri, s, &es_out.out );
+    if( demux == nullptr )
+    {
+        msg_Dbg( p_parent, "cc subtitle convert: %s is not a subtitle file VLC recognizes",
+                psz_uri );
+        vlc_stream_Delete( s );
+        return nullptr;
+    }
+
+    int ret;
+    do
+        ret = demux_Demux( demux );
+    while( ret == VLC_DEMUXER_SUCCESS );
+
+    demux_Delete( demux ); /* also deletes s */
+
+    return EncodeToWebVTT( p_parent, es_out.decoder, i_offset, psz_uri );
+}
+
+char *chromecast_ConvertEmbeddedTrackToWebVTT( vlc_object_t *p_parent,
+                                               const char *psz_uri,
+                                               const char *psz_demux,
+                                               int i_track_id,
+                                               vlc_tick_t i_offset )
+{
+    stream_t *s = vlc_stream_NewURL( p_parent, psz_uri );
+    if( s == nullptr )
+    {
+        msg_Warn( p_parent, "cc embedded subtitle convert: vlc_stream_NewURL failed for %s",
+                 psz_uri );
+        return nullptr;
+    }
+
+    SubtitleEsOut es_out = { { &es_out_cbs }, p_parent, nullptr, nullptr, i_track_id, {} };
+    /* Ask for the exact demux module the master source is already using,
+     * not "any"/auto-detection: this is a second, independent pass over
+     * the same file, and it has to see the same track layout - and
+     * therefore assign the same track ids - as the live session that
+     * i_track_id was taken from. */
+    demux_t *demux = demux_New( p_parent, psz_demux, psz_uri, s, &es_out.out );
+    if( demux == nullptr )
+    {
+        msg_Dbg( p_parent, "cc embedded subtitle convert: %s could not be reopened with "
+                "the \"%s\" demuxer", psz_uri, psz_demux );
+        vlc_stream_Delete( s );
+        return nullptr;
+    }
+
+    int ret;
+    do
+        ret = demux_Demux( demux );
+    while( ret == VLC_DEMUXER_SUCCESS );
+
+    demux_Delete( demux ); /* also deletes s */
+
+    for( void *p : es_out.placeholders )
+        free( p );
+
+    return EncodeToWebVTT( p_parent, es_out.decoder, i_offset, psz_uri );
 }
