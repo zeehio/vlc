@@ -267,18 +267,79 @@ struct demux_cc
     }
 
     /**
-     * Look for an external SRT/WebVTT subtitle slave on the input item and,
-     * if found, hand it over as a Cast sidecar text track. Only external
-     * slaves are considered (not embedded tracks): this is the only case
-     * where the whole subtitle content is available upfront, which a sidecar
-     * track needs since it is fetched once by the Cast receiver rather than
-     * streamed incrementally. Re-evaluated each time this demux filter is
-     * (re)enabled, so subtitles added before a cast starts are picked up;
-     * slaves added while already casting need a session restart to appear.
+     * DEMUX_SET_ES/DEMUX_SET_ES_LIST carry the newly-selected id(s) for
+     * whichever category(ies) actually changed on this source - audio,
+     * video and/or SPU, all mixed together - so this looks each one up
+     * in the input item's own ES list (populated for every discovered
+     * track, see the audio-track counting in init() above) to tell
+     * whether an embedded subtitle track is among them. Mirrors, for
+     * embedded tracks, what an external slave's own filter instance does
+     * unconditionally in Control() below: report itself as "the
+     * subtitle that was just selected" (see chromecast_common.h's
+     * pf_set_selected_subtitle_track). An audio/video-only change (no
+     * SPU id present) intentionally leaves whatever was last reported
+     * alone.
+     */
+    void reportSelectedEmbeddedSubtitleTrack( int i_query, va_list args )
+    {
+        input_item_t *p_item = p_demux->s->p_input_item;
+        if( p_item == NULL )
+            return;
+
+        va_list ap;
+        va_copy( ap, args );
+        int i_single_id;
+        const int *p_ids;
+        size_t i_count;
+        if( i_query == DEMUX_SET_ES )
+        {
+            i_single_id = va_arg( ap, int );
+            p_ids = &i_single_id;
+            i_count = 1;
+        }
+        else
+        {
+            i_count = va_arg( ap, size_t );
+            p_ids = va_arg( ap, const int * );
+        }
+
+        vlc_mutex_lock( &p_item->lock );
+        for( size_t i = 0; p_ids != NULL && i < i_count; ++i )
+        {
+            for( size_t j = 0; j < p_item->es_vec.size; ++j )
+            {
+                const struct input_item_es *p_es = &p_item->es_vec.data[j];
+                if( p_es->es.i_id == p_ids[i] && p_es->es.i_cat == SPU_ES )
+                {
+                    msg_Dbg( p_demux, "cc subtitle scan: embedded SPU track %d selected",
+                            p_ids[i] );
+                    p_renderer->pf_set_selected_subtitle_track( p_renderer->p_opaque,
+                                                                p_ids[i] );
+                    vlc_mutex_unlock( &p_item->lock );
+                    va_end( ap );
+                    return;
+                }
+            }
+        }
+        vlc_mutex_unlock( &p_item->lock );
+        va_end( ap );
+    }
+
+    /**
+     * Look for a subtitle to hand over as a Cast sidecar text track: an
+     * external SRT/WebVTT slave, or (failing that) an explicitly-selected
+     * embedded track on the master source itself - the only two cases
+     * where the whole subtitle content is available upfront, which a
+     * sidecar track needs since it is fetched once by the Cast receiver
+     * rather than streamed incrementally. Re-evaluated each time this
+     * demux filter is (re)enabled, so subtitles added/selected before a
+     * cast starts are picked up; slaves added or tracks selected while
+     * already casting need a session restart to appear.
      */
     void setSubtitleFromSlaves()
     {
         std::string uri;
+        int i_embedded_track_id = -1;
         input_item_t *p_item = p_demux->s->p_input_item;
         msg_Dbg( p_demux, "cc subtitle scan: p_item=%p", (void*)p_item );
 
@@ -286,10 +347,7 @@ struct demux_cc
          * selected (see chromecast_common.h's pf_set_selected_subtitle_uri):
          * each external subtitle file is its own input source with its own
          * demux filter instance, which reports itself here the moment its
-         * own track gets selected. Falling back to "the first external
-         * slave found" below only applies before any selection has ever
-         * been reported, e.g. right after casting starts with a subtitle
-         * already showing by default. */
+         * own track gets selected. */
         char *psz_selected =
             p_renderer->pf_get_selected_subtitle_uri( p_renderer->p_opaque );
         if( psz_selected != NULL )
@@ -297,32 +355,54 @@ struct demux_cc
             uri = psz_selected;
             free( psz_selected );
         }
-        else if( p_item )
+        else
         {
-            vlc_mutex_lock( &p_item->lock );
-            msg_Dbg( p_demux, "cc subtitle scan: i_slaves=%d", p_item->i_slaves );
-            for( int i = 0; i < p_item->i_slaves; ++i )
+            /* Next, an explicitly-selected embedded track (see
+             * reportSelectedEmbeddedSubtitleTrack() above). Unlike an
+             * external slave, there is no "first embedded track found"
+             * fallback below this: there is no equally simple,
+             * container-agnostic way to tell which track (if any)
+             * playback is already showing by default without an explicit
+             * selection ever having been reported, so a default-selected
+             * embedded subtitle is only picked up once it is (re)selected
+             * from the Subtitles menu. */
+            i_embedded_track_id =
+                p_renderer->pf_get_selected_subtitle_track( p_renderer->p_opaque );
+
+            /* Falling back to "the first external slave found" only
+             * applies once neither of the above has ever been reported,
+             * e.g. right after casting starts with a subtitle already
+             * showing by default. */
+            if( i_embedded_track_id < 0 && p_item )
             {
-                const input_item_slave_t *p_slave = p_item->pp_slaves[i];
-                msg_Dbg( p_demux, "cc subtitle scan: slave[%d] type=%d uri=%s",
-                        i, (int)p_slave->i_type, p_slave->psz_uri );
-                if( p_slave->i_type != SLAVE_TYPE_SPU )
-                    continue;
-                /* Take the first external SPU slave; whether it can
-                 * actually become a sidecar track is for the subtitle
-                 * demux/decode/encode chain below to decide; it already
-                 * has to fail gracefully for embedded/unsupported formats,
-                 * so there is no format allowlist to maintain here. */
-                uri = p_slave->psz_uri;
-                break;
+                vlc_mutex_lock( &p_item->lock );
+                msg_Dbg( p_demux, "cc subtitle scan: i_slaves=%d", p_item->i_slaves );
+                for( int i = 0; i < p_item->i_slaves; ++i )
+                {
+                    const input_item_slave_t *p_slave = p_item->pp_slaves[i];
+                    msg_Dbg( p_demux, "cc subtitle scan: slave[%d] type=%d uri=%s",
+                            i, (int)p_slave->i_type, p_slave->psz_uri );
+                    if( p_slave->i_type != SLAVE_TYPE_SPU )
+                        continue;
+                    /* Take the first external SPU slave; whether it can
+                     * actually become a sidecar track is for the subtitle
+                     * demux/decode/encode chain below to decide; it already
+                     * has to fail gracefully for embedded/unsupported formats,
+                     * so there is no format allowlist to maintain here. */
+                    uri = p_slave->psz_uri;
+                    break;
+                }
+                vlc_mutex_unlock( &p_item->lock );
             }
-            vlc_mutex_unlock( &p_item->lock );
         }
 
-        if( uri.empty() )
-            msg_Dbg( p_demux, "cc subtitle scan: no external SPU slave found" );
-        else
+        if( uri.empty() && i_embedded_track_id < 0 )
+            msg_Dbg( p_demux, "cc subtitle scan: no subtitle source found" );
+        else if( !uri.empty() )
             msg_Dbg( p_demux, "cc subtitle scan: using slave uri=%s", uri.c_str() );
+        else
+            msg_Dbg( p_demux, "cc subtitle scan: using embedded track id=%d",
+                    i_embedded_track_id );
 
         /* Direct-serve: the receiver plays (and seeks) the source's own absolute
          * timeline directly, so the sidecar track must match the file's
@@ -338,14 +418,33 @@ struct demux_cc
          * Callers wait for pf_is_eligibility_decided() before the first
          * scan (see Demux() below) so this is never a guess. */
         bool b_direct_serve = p_renderer->pf_is_source_direct( p_renderer->p_opaque );
+        bool b_have_source = !uri.empty() || i_embedded_track_id >= 0;
         vlc_tick_t offset = 0;
-        if( !uri.empty() && !b_direct_serve
+        if( b_have_source && !b_direct_serve
          && demux_Control( p_demux->s, DEMUX_GET_TIME, &offset ) != VLC_SUCCESS )
             offset = 0;
 
-        char *psz_webvtt = uri.empty() ? NULL
-                          : chromecast_ConvertSubtitleFileToWebVTT( VLC_OBJECT(p_demux),
-                                                                    uri.c_str(), offset );
+        char *psz_webvtt = NULL;
+        if( !uri.empty() )
+        {
+            psz_webvtt = chromecast_ConvertSubtitleFileToWebVTT( VLC_OBJECT(p_demux),
+                                                                  uri.c_str(), offset );
+        }
+        else if( i_embedded_track_id >= 0 && p_item )
+        {
+            /* Same URL and demux module as reported to cast.cpp for
+             * direct-serve eligibility (see init() above) - just fetched
+             * fresh here rather than plumbed through intf_sys_t, the same
+             * way the external-slave scan above always re-reads
+             * p_item->pp_slaves rather than caching it. */
+            char *psz_url = input_item_GetURI( p_item );
+            char *psz_master_demux = var_GetString( p_demux->s, "module-name" );
+            if( psz_url != NULL && psz_master_demux != NULL )
+                psz_webvtt = chromecast_ConvertEmbeddedTrackToWebVTT( VLC_OBJECT(p_demux),
+                        psz_url, psz_master_demux, i_embedded_track_id, offset );
+            free( psz_url );
+            free( psz_master_demux );
+        }
         msg_Dbg( p_demux, "cc subtitle scan: webvtt %s (segment offset %" PRId64 "ms, direct_serve=%d)",
                 psz_webvtt ? "generated" : "NULL (not set)", MS_FROM_VLC_TICK( offset ), b_direct_serve );
         p_renderer->pf_set_subtitle( p_renderer->p_opaque, psz_webvtt );
@@ -721,7 +820,10 @@ struct demux_cc
                                                           p_demux->s->psz_url );
             }
             else
+            {
                 m_subtitle_scanned = false;
+                reportSelectedEmbeddedSubtitleTrack( i_query, args );
+            }
             break;
         case DEMUX_FILTER_ENABLE:
             p_renderer = static_cast<chromecast_common *>(
